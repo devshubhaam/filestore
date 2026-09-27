@@ -265,6 +265,31 @@ def build_refer_text(bot_username: str, user_id: int, stats: dict) -> str:
     return "\n\n".join([header, desc, link_line, stats_line])
 
 
+def build_free_limit_text(enabled: bool, count: int) -> str:
+    header = "🆓 <u>" + to_bold_unicode("Free usage limit:") + "</u>"
+    status = to_bold_unicode(f"Status: {'ON ✅' if enabled else 'OFF ❌'}")
+    count_line = to_bold_unicode(f"Free uses per day: {count}")
+    desc = (
+        "<blockquote>"
+        + to_bold_unicode(
+            "When enabled, non-premium users will be limited to this many "
+            "free uses per day. Premium users are never limited."
+        )
+        + "</blockquote>"
+    )
+    return "\n\n".join([header, desc, status, count_line])
+
+
+def build_free_limit_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_label = "🔒 Limit is on - ✅" if enabled else "🔓 Limit is off - ❌"
+    keyboard = [
+        [InlineKeyboardButton("✏️ Set daily limit", callback_data="free_limit_set")],
+        [InlineKeyboardButton(toggle_label, callback_data="free_limit_toggle")],
+        [InlineKeyboardButton("◀ Back", callback_data="free_limit_back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def build_start_text(user_first_name: str) -> str:
     # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
     # characters, so only <blockquote> (structural, not styling) needs HTML.
@@ -317,7 +342,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 SETTINGS_PLACEHOLDER_CALLBACKS = {
-    "settings_free_limit",
     "settings_link_shortener",
     "settings_token_verification",
     "settings_force_subscribe",
@@ -467,6 +491,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     # --------------------------------------------------------------------
 
+    # ---------------- Free usage limit panel (admin-only) ----------------
+    if data == "free_limit_set":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = "free_limit_count"
+        await query.edit_message_text(
+            text="✏️ " + to_bold_unicode("Send the number of free uses allowed per day, e.g.")
+            + "\n<code>5</code>\n\n"
+            + to_bold_unicode("Send /cancel to cancel."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "free_limit_toggle":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        currently_on = await payments.is_free_limit_enabled()
+        await payments.set_free_limit_enabled(not currently_on)
+        await query.answer("Free usage limit turned " + ("OFF ❌" if currently_on else "ON ✅"))
+        count = await payments.get_free_limit_count()
+        await query.edit_message_text(
+            text=build_free_limit_text(not currently_on, count),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_free_limit_keyboard(not currently_on),
+        )
+        return
+
+    if data == "free_limit_back":
+        await query.answer()
+        await query.edit_message_text(
+            text=build_settings_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_settings_keyboard(),
+        )
+        return
+    # --------------------------------------------------------------------
+
     await query.answer()
 
     if data == "help":
@@ -518,6 +582,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.HTML,
             reply_markup=build_settings_keyboard(),
         )
+    elif data == "settings_free_limit":
+        enabled = await payments.is_free_limit_enabled()
+        count = await payments.get_free_limit_count()
+        if is_admin(user.id):
+            await query.edit_message_text(
+                text=build_free_limit_text(enabled, count),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_free_limit_keyboard(enabled),
+            )
+        else:
+            info = build_free_limit_text(enabled, count)
+            await query.edit_message_text(
+                text=info,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀ Back", callback_data="settings")]]
+                ),
+            )
     elif data == "settings_refer":
         me = await context.bot.get_me()
         stats = await payments.get_referral_stats(user.id)
@@ -713,6 +795,21 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text(
                 "⚠️ " + to_bold_unicode(f"User {target_id} was not a premium user.")
             )
+        return
+
+    if awaiting == "free_limit_count":
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit():
+            await update.message.reply_text(
+                "⚠️ Invalid number. Send a whole number like 5 (or /cancel)."
+            )
+            return
+        count = int(raw)
+        await payments.set_free_limit_count(count)
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            "✅ " + to_bold_unicode(f"Free usage limit set to {count} per day.")
+        )
         return
 
     if awaiting == "premium_message_text":
