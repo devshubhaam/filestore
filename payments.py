@@ -855,18 +855,185 @@ async def handle_webhook(request: web.Request) -> web.Response:
     return web.Response(text="OK" if ok else f"ERR: {msg}")
 
 
+def _status_page(success: bool, heading: str, subtitle: str, link: str, button_label: str) -> str:
+    """Renders a self-contained, animated payment-result page (green
+    check-in-circle for success, red cross for failure) with a button
+    back to the bot."""
+    accent = "#22c55e" if success else "#ef4444"
+    accent_dark = "#16a34a" if success else "#dc2626"
+    glow = "rgba(34,197,94,0.35)" if success else "rgba(239,68,68,0.35)"
+    icon_svg = (
+        # Checkmark
+        '<path class="icon-path" d="M28 52 L44 68 L76 32" fill="none" '
+        'stroke="#ffffff" stroke-width="8" stroke-linecap="round" '
+        'stroke-linejoin="round"/>'
+        if success else
+        # Cross
+        '<path class="icon-path" d="M34 34 L66 66 M66 34 L34 66" fill="none" '
+        'stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>'
+    )
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{html.escape(heading)}</title>
+<style>
+  :root {{
+    --accent: {accent};
+    --accent-dark: {accent_dark};
+    --glow: {glow};
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{
+    height: 100%;
+    margin: 0;
+  }}
+  body {{
+    min-height: 100dvh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    padding-top: calc(24px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    background: radial-gradient(circle at 50% 20%, #1b2440 0%, #0b0f1f 55%, #05060c 100%);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #f4f6fb;
+  }}
+  .card {{
+    text-align: center;
+    max-width: 420px;
+    width: 100%;
+    animation: fade-up 0.6s ease-out both;
+  }}
+  .icon-wrap {{
+    position: relative;
+    width: 140px;
+    height: 140px;
+    margin: 0 auto 28px;
+  }}
+  .icon-glow {{
+    position: absolute;
+    inset: -20px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--glow) 0%, transparent 70%);
+    filter: blur(6px);
+    animation: pulse 2.2s ease-in-out infinite;
+  }}
+  .icon-circle {{
+    position: relative;
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    background: linear-gradient(145deg, var(--accent) 0%, var(--accent-dark) 100%);
+    box-shadow:
+      0 10px 30px var(--glow),
+      inset 0 -6px 14px rgba(0,0,0,0.25),
+      inset 0 6px 10px rgba(255,255,255,0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: pop-in 0.55s cubic-bezier(.34,1.56,.64,1) both;
+  }}
+  .icon-circle svg {{ width: 78px; height: 78px; }}
+  .icon-path {{
+    stroke-dasharray: 100;
+    stroke-dashoffset: 100;
+    animation: draw 0.5s 0.35s ease-out forwards;
+  }}
+  h1 {{
+    font-size: 26px;
+    margin: 0 0 10px;
+    letter-spacing: -0.02em;
+  }}
+  p.subtitle {{
+    font-size: 15px;
+    line-height: 1.5;
+    color: #a9b0c6;
+    margin: 0 0 32px;
+  }}
+  .btn {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 16px;
+    padding: 14px 30px;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #7c6bff 0%, #5b8dff 100%);
+    box-shadow: 0 8px 24px rgba(91,141,255,0.35);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }}
+  .btn:active {{
+    transform: scale(0.96);
+    box-shadow: 0 4px 14px rgba(91,141,255,0.35);
+  }}
+  @keyframes pop-in {{
+    0% {{ transform: scale(0.4); opacity: 0; }}
+    100% {{ transform: scale(1); opacity: 1; }}
+  }}
+  @keyframes draw {{
+    to {{ stroke-dashoffset: 0; }}
+  }}
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 0.55; transform: scale(1); }}
+    50% {{ opacity: 1; transform: scale(1.08); }}
+  }}
+  @keyframes fade-up {{
+    0% {{ opacity: 0; transform: translateY(14px); }}
+    100% {{ opacity: 1; transform: translateY(0); }}
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-wrap">
+      <div class="icon-glow"></div>
+      <div class="icon-circle">
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">{icon_svg}</svg>
+      </div>
+    </div>
+    <h1>{html.escape(heading)}</h1>
+    <p class="subtitle">{html.escape(subtitle)}</p>
+    <a class="btn" href="{html.escape(link)}">🚀 {html.escape(button_label)}</a>
+  </div>
+</body>
+</html>"""
+
+
 async def handle_success(request: web.Request) -> web.Response:
     params = await _params_from_request(request)
     bot = request.app["telegram_bot"]
     ok, msg = await process_payu_response(params, bot)
     username = request.app.get("bot_username", "")
     link = f"https://t.me/{username}" if username else "#"
-    title = "Payment successful 🎉" if ok and msg in ("success", "already processed") else "Payment received"
-    return web.Response(
-        text=f"<html><body><h2>{title}</h2>"
-             f"<p><a href='{link}'>Return to Telegram</a></p></body></html>",
-        content_type="text/html",
+    success = ok and msg in ("success", "already processed")
+
+    subtitle = "Your premium plan is now active." if success else "We couldn't confirm this payment."
+    txnid = params.get("txnid")
+    if success and txnid:
+        txn = await get_transaction(txnid)
+        if txn:
+            expiry_iso = await get_premium_expiry(txn["user_id"])
+            if expiry_iso:
+                try:
+                    expiry = datetime.fromisoformat(expiry_iso)
+                    plan_label = txn.get("plan_label", PLAN_LABEL)
+                    subtitle = f"{plan_label} is active until {expiry.strftime('%d %b %Y')}."
+                except Exception:
+                    pass
+
+    page = _status_page(
+        success=success,
+        heading="Payment Successful" if success else "Payment Received",
+        subtitle=subtitle,
+        link=link,
+        button_label="Back to Bot",
     )
+    return web.Response(text=page, content_type="text/html")
 
 
 async def handle_failure(request: web.Request) -> web.Response:
@@ -875,11 +1042,14 @@ async def handle_failure(request: web.Request) -> web.Response:
     await process_payu_response(params, bot)
     username = request.app.get("bot_username", "")
     link = f"https://t.me/{username}" if username else "#"
-    return web.Response(
-        text="<html><body><h2>Payment failed or cancelled</h2>"
-             f"<p><a href='{link}'>Return to Telegram</a></p></body></html>",
-        content_type="text/html",
+    page = _status_page(
+        success=False,
+        heading="Payment Failed",
+        subtitle="Your payment didn't go through, or was cancelled. No amount was charged.",
+        link=link,
+        button_label="Back to Bot",
     )
+    return web.Response(text=page, content_type="text/html")
 
 
 def build_web_app(telegram_bot) -> web.Application:
