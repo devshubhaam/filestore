@@ -17,7 +17,7 @@ import os
 import uuid
 import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from aiohttp import web
@@ -85,6 +85,10 @@ def build_help_text() -> str:
         ("id", "Get your telegram ID."),
     ])
 
+    buy_plan = section("💰", "Buy", [
+        ("buy", "Buy the premium plan."),
+    ])
+
     file_storage = section("📦", "File storage commands", [
         ("link", "Store a single file or message."),
         ("batch", "Store multiple consecutive messages from a channel."),
@@ -113,7 +117,7 @@ def build_help_text() -> str:
     header = "🎓 <u>" + to_bold_unicode("Help menu:") + "</u>"
 
     return "\n\n".join(
-        [header, intro, basic, file_storage, premium, user_settings, admin]
+        [header, intro, basic, buy_plan, file_storage, premium, user_settings, admin]
     )
 
 
@@ -234,15 +238,28 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"💳 Pay ₹{payments.PLAN_AMOUNT} now", url=pay_url)]]
+        [[InlineKeyboardButton(
+            f"💳 Pay ₹{payments.PLAN_AMOUNT} now",
+            web_app=WebAppInfo(url=pay_url),
+        )]]
     )
     text = (
-        to_bold_unicode(f"{payments.PLAN_LABEL} - ₹{payments.PLAN_AMOUNT}") + "\n\n"
-        + to_bold_unicode(f"Valid for {payments.PLAN_DAYS} days.") + "\n\n"
-        + "Tap the button below to pay — UPI (opens your UPI app), UPI QR, "
-        "cards, netbanking and wallets are all available on the payment page."
+        "💎 " + to_bold_unicode(f"{payments.PLAN_LABEL} - ₹{payments.PLAN_AMOUNT}")
+        + "\n\n"
+        + "<blockquote>"
+        + "⏳ " + to_bold_unicode(f"Valid for {payments.PLAN_DAYS} days.") + "\n"
+        + "💳 " + to_bold_unicode(
+            "Pay via UPI, UPI QR, cards, netbanking or wallet — all shown "
+            "on the payment page."
+        )
+        + "</blockquote>\n\n"
+        + to_bold_unicode("Tap the button below to pay.")
     )
-    await update.message.reply_text(text=text, reply_markup=keyboard)
+    await update.message.reply_text(
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 
 async def main() -> None:
