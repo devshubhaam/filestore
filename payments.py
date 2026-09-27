@@ -20,9 +20,7 @@ Required environment variables:
                  success/failure/webhook callback URLs)
 
 Optional:
-  PLAN_AMOUNT  - default "9"
-  PLAN_DAYS    - default "30"
-  PLAN_LABEL   - default "Premium Plan"
+  PLAN_LABEL   - default "Premium Plan" (brand name shown on the buy card)
 """
 
 import os
@@ -47,9 +45,25 @@ PAYU_SALT = os.environ.get("PAYU_SALT", "")
 PAYU_MODE = os.environ.get("PAYU_MODE", "test").lower()
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-PLAN_AMOUNT = os.environ.get("PLAN_AMOUNT", "10")
-PLAN_DAYS = int(os.environ.get("PLAN_DAYS", "30"))
 PLAN_LABEL = os.environ.get("PLAN_LABEL", "Premium Plan")
+
+# Multiple premium plan tiers. `id` is used in callback_data, so keep it
+# short and stable — changing an existing id will orphan any pending
+# transactions using the old one (harmless, they just expire unused).
+PLANS = [
+    {"id": "1day", "label": "1 Day", "days": 1, "amount": "5"},
+    {"id": "1week", "label": "1 Week", "days": 7, "amount": "19"},
+    {"id": "1month", "label": "1 Month", "days": 30, "amount": "49"},
+    {"id": "3months", "label": "3 Months", "days": 90, "amount": "99"},
+]
+
+
+def get_plan(plan_id: str) -> dict | None:
+    for p in PLANS:
+        if p["id"] == plan_id:
+            return p
+    return None
+
 
 PAYU_PAYMENT_URL = (
     "https://secure.payu.in/_payment"
@@ -709,8 +723,10 @@ async def process_payu_response(params: dict, bot) -> tuple[bool, str]:
         return True, "already processed"
 
     if status == "success":
-        expiry = datetime.now(timezone.utc) + timedelta(days=txn["plan_days"])
-        await set_premium(txn["user_id"], expiry.isoformat())
+        # Extend on top of any remaining active premium instead of
+        # overwriting it, so buying/extending never shortens a plan.
+        new_expiry_iso = await grant_premium_days(txn["user_id"], txn["plan_days"])
+        expiry = datetime.fromisoformat(new_expiry_iso)
         txn["status"] = "success"
         await save_transaction(txnid, txn)
         try:
