@@ -174,6 +174,33 @@ def build_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def build_premium_menu_text() -> str:
+    header = "💸 <u>" + to_bold_unicode("Premium Plan:") + "</u>"
+    desc = (
+        "<blockquote>"
+        + to_bold_unicode(
+            "Premium Plan: A paid subscription that gives users ad-free "
+            "access, faster downloads, and exclusive entry to restricted "
+            "files or groups."
+        )
+        + "</blockquote>"
+    )
+    return f"{header}\n\n{desc}"
+
+
+def build_premium_menu_keyboard(premium_on: bool = True) -> InlineKeyboardMarkup:
+    toggle_label = "🔒 Premium is on - ✅" if premium_on else "🔓 Premium is off - ❌"
+    keyboard = [
+        [InlineKeyboardButton("🧵 Premium plan message 🧵", callback_data="premium_plan_message")],
+        [InlineKeyboardButton("➕ Add premium user ➕", callback_data="premium_add_user")],
+        [InlineKeyboardButton("➖ Remove premium user ➖", callback_data="premium_remove_user")],
+        [InlineKeyboardButton("🚦 Premium users list 🚦", callback_data="premium_users_list")],
+        [InlineKeyboardButton(toggle_label, callback_data="premium_toggle")],
+        [InlineKeyboardButton("◀ Back", callback_data="premium_back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def build_start_text(user_first_name: str) -> str:
     # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
     # characters, so only <blockquote> (structural, not styling) needs HTML.
@@ -230,11 +257,23 @@ SETTINGS_PLACEHOLDER_CALLBACKS = {
     "settings_protect_content",
 }
 
+PREMIUM_PLACEHOLDER_CALLBACKS = {
+    "premium_plan_message",
+    "premium_add_user",
+    "premium_remove_user",
+    "premium_users_list",
+    "premium_toggle",
+}
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
-    if query.data in ("help_settings", "help_about") or query.data in SETTINGS_PLACEHOLDER_CALLBACKS:
+    if (
+        query.data in ("help_settings", "help_about")
+        or query.data in SETTINGS_PLACEHOLDER_CALLBACKS
+        or query.data in PREMIUM_PLACEHOLDER_CALLBACKS
+    ):
         # Just display for now — not wired up to real logic yet.
         await query.answer(text="Yeh feature jaldi aa raha hai 🚧", show_alert=True)
         return
@@ -259,18 +298,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=build_settings_keyboard(),
         )
     elif query.data == "settings_premium":
-        user = update.effective_user
-        offer = await build_buy_offer(user, update.effective_chat.id)
-        if offer is None:
-            await query.edit_message_text(
-                text="⚠️ Payment gateway isn't configured yet."
-            )
-            return
-        text, keyboard = offer
         await query.edit_message_text(
-            text=text,
+            text=build_premium_menu_text(),
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            reply_markup=build_premium_menu_keyboard(),
+        )
+    elif query.data == "premium_back":
+        await query.edit_message_text(
+            text=build_settings_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_settings_keyboard(),
         )
     elif query.data == "settings_back":
         user = update.effective_user
