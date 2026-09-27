@@ -29,14 +29,40 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-BOT-TOKEN-HERE")
 
 
+def to_bold_unicode(text: str) -> str:
+    """Convert A-Z, a-z, 0-9 in `text` to Mathematical Sans-Serif Bold
+    Unicode codepoints. Everything else (spaces, punctuation, emoji) is
+    left untouched, so this needs no parse_mode to render bold."""
+    result = []
+    for ch in text:
+        code = ord(ch)
+        if 0x41 <= code <= 0x5A:          # A-Z
+            result.append(chr(0x1D5D4 + (code - 0x41)))
+        elif 0x61 <= code <= 0x7A:        # a-z
+            result.append(chr(0x1D5EE + (code - 0x61)))
+        elif 0x30 <= code <= 0x39:        # 0-9
+            result.append(chr(0x1D7EC + (code - 0x30)))
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
 def build_start_text(user_first_name: str) -> str:
-    # HTML parse mode: <b> for bold, <blockquote> for the quoted lines
+    # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
+    # characters, so only <blockquote> (structural, not styling) needs HTML.
+    line1 = to_bold_unicode(f"Hey {user_first_name},")
+    line2 = to_bold_unicode("My name is Haven 🌺")
+    line3 = to_bold_unicode(
+        "I am a permanent file store bot and users can access stored "
+        "messages by using a shareable link given by me."
+    )
+    line4 = to_bold_unicode("To know more click help button.")
+
     text = (
-        f"<b>Hey {user_first_name},</b>\n\n"
-        f"<blockquote><b>My name is Haven 🌺</b></blockquote>\n\n"
-        f"<b>I am a permanent file store bot and users can access stored "
-        f"messages by using a shareable link given by me.</b>\n\n"
-        f"<blockquote><b>To know more click help button.</b></blockquote>"
+        f"{line1}\n\n"
+        f"<blockquote>{line2}</blockquote>\n\n"
+        f"{line3}\n\n"
+        f"<blockquote>{line4}</blockquote>"
     )
     return text
 
@@ -69,20 +95,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == "help":
         await query.edit_message_text(
-            text="<b>Help Menu</b>\n\nSend me any file and I'll generate a "
-                 "shareable permanent link for it. Use that link to retrieve "
-                 "the file anytime.",
-            parse_mode=ParseMode.HTML,
+            text=to_bold_unicode("Help Menu") + "\n\n"
+                 "Send me any file and I'll generate a shareable permanent "
+                 "link for it. Use that link to retrieve the file anytime.",
         )
     elif query.data == "about":
         await query.edit_message_text(
-            text="<b>About</b>\n\nI'm Haven 🌺 — a permanent file store bot.",
-            parse_mode=ParseMode.HTML,
+            text=to_bold_unicode("About") + "\n\n"
+                 "I'm Haven 🌺 — a permanent file store bot.",
         )
     elif query.data == "settings":
         await query.edit_message_text(
-            text="<b>Settings</b>\n\n(configure your preferences here)",
-            parse_mode=ParseMode.HTML,
+            text=to_bold_unicode("Settings") + "\n\n"
+                 "(configure your preferences here)",
         )
 
 
