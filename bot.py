@@ -47,6 +47,85 @@ def to_bold_unicode(text: str) -> str:
     return "".join(result)
 
 
+def build_help_text() -> str:
+    intro = (
+        "<blockquote>"
+        "🤖 " + to_bold_unicode("I am a permanent file store bot") + "\n"
+        "📧 " + to_bold_unicode(
+            "My name is file store bot, but I can store any type of "
+            "content, including messages, photos, videos, and files."
+        ) + "\n"
+        "📁 " + to_bold_unicode(
+            "You can store files from your public channel without adding "
+            "me as an admin."
+        ) + "\n"
+        "🔒 " + to_bold_unicode(
+            "If your channel or group is private, make me an admin first."
+        ) + "\n"
+        "🔗 " + to_bold_unicode(
+            "After storing, I will generate a shareable link for instant "
+            "access to your files."
+        )
+        + "</blockquote>"
+    )
+
+    def section(emoji: str, title: str, commands: list[tuple[str, str]]) -> str:
+        head = f"<blockquote>{emoji} " + to_bold_unicode(title) + "</blockquote>"
+        body = "\n".join(
+            f"➤ /{cmd} - " + to_bold_unicode(desc) for cmd, desc in commands
+        )
+        return f"{head}\n{body}"
+
+    basic = section("📚", "Basic commands", [
+        ("start", "Check if I'm alive."),
+        ("id", "Get your telegram ID."),
+    ])
+
+    file_storage = section("📦", "File storage commands", [
+        ("link", "Store a single file or message."),
+        ("batch", "Store multiple consecutive messages from a channel."),
+        ("custom_batch", "Store multiple random messages."),
+        ("multiple_batch", "Create multiple batch links at once."),
+        ("special_link", "Create special links with custom settings."),
+    ])
+
+    premium = section("💎", "Premium commands", [
+        ("createcode", "Create premium redeem codes."),
+        ("redeem", "Redeem a premium code."),
+        ("myplan", "View your premium plan details."),
+    ])
+
+    user_settings = section("⚙️", "User settings", [
+        ("settings", "Customize your personal settings."),
+    ])
+
+    admin = section("👑", "Admin commands", [
+        ("customize", "Customize clone bot settings."),
+        ("broadcast", "Broadcast a message to all users."),
+        ("ban", "Ban a user from the bot."),
+        ("unban", "Unban a previously banned user."),
+    ])
+
+    header = "🎓 <u>" + to_bold_unicode("Help menu:") + "</u>"
+
+    return "\n\n".join(
+        [header, intro, basic, file_storage, premium, user_settings, admin]
+    )
+
+
+def build_help_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("‼️ Settings ‼️", callback_data="help_settings"),
+            InlineKeyboardButton("📜 About", callback_data="help_about"),
+        ],
+        [
+            InlineKeyboardButton("◀ Back", callback_data="help_back"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def build_start_text(user_first_name: str) -> str:
     # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
     # characters, so only <blockquote> (structural, not styling) needs HTML.
@@ -95,9 +174,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == "help":
         await query.edit_message_text(
-            text=to_bold_unicode("Help Menu") + "\n\n"
-                 "Send me any file and I'll generate a shareable permanent "
-                 "link for it. Use that link to retrieve the file anytime.",
+            text=build_help_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_help_keyboard(),
         )
     elif query.data == "about":
         await query.edit_message_text(
@@ -109,6 +188,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text=to_bold_unicode("Settings") + "\n\n"
                  "(configure your preferences here)",
         )
+    elif query.data == "help_back":
+        user = update.effective_user
+        await query.edit_message_text(
+            text=build_start_text(user.first_name),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_start_keyboard(),
+        )
+    elif query.data in ("help_settings", "help_about"):
+        # Just display for now — not wired up to real logic yet.
+        await query.answer(text="Yeh feature jaldi aa raha hai 🚧", show_alert=True)
 
 
 def main() -> None:
