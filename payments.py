@@ -114,6 +114,68 @@ async def is_premium(user_id: int) -> bool:
         return False
 
 
+def _get_settings(data: dict) -> dict:
+    settings = data.setdefault("settings", {})
+    settings.setdefault("premium_enabled", True)
+    pm = settings.setdefault("premium_message", {})
+    pm.setdefault("text", None)
+    pm.setdefault("photo_file_id", None)
+    pm.setdefault("button_text", None)
+    pm.setdefault("button_url", None)
+    return settings
+
+
+async def is_premium_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["premium_enabled"]
+
+
+async def set_premium_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["premium_enabled"] = value
+        _save_data(data)
+
+
+async def get_premium_message() -> dict:
+    async with DATA_LOCK:
+        data = _load_data()
+        return dict(_get_settings(data)["premium_message"])
+
+
+async def set_premium_message(**fields) -> None:
+    """Update one or more fields of the custom premium-plan message
+    (text, photo_file_id, button_text, button_url). Only the fields
+    passed in are changed."""
+    async with DATA_LOCK:
+        data = _load_data()
+        pm = _get_settings(data)["premium_message"]
+        pm.update(fields)
+        _save_data(data)
+
+
+async def list_premium() -> dict:
+    """Returns {user_id_str: expiry_iso} for every user ever granted
+    premium (including expired ones)."""
+    async with DATA_LOCK:
+        data = _load_data()
+        return dict(data.get("premium", {}))
+
+
+async def remove_premium(user_id: int) -> bool:
+    """Removes a user from the premium store. Returns True if they were
+    present, False if they weren't premium to begin with."""
+    async with DATA_LOCK:
+        data = _load_data()
+        key = str(user_id)
+        if key in data.get("premium", {}):
+            del data["premium"][key]
+            _save_data(data)
+            return True
+        return False
+
+
 # --------------------------------------------------------------------------
 # PayU hashing
 # --------------------------------------------------------------------------
