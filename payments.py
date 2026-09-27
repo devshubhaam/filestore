@@ -144,7 +144,35 @@ def _get_settings(data: dict) -> dict:
     pm.setdefault("photo_file_id", None)
     pm.setdefault("button_text", None)
     pm.setdefault("button_url", None)
+    settings.setdefault("free_limit_enabled", False)
+    settings.setdefault("free_limit_count", 5)
     return settings
+
+
+async def is_free_limit_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["free_limit_enabled"]
+
+
+async def set_free_limit_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["free_limit_enabled"] = value
+        _save_data(data)
+
+
+async def get_free_limit_count() -> int:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["free_limit_count"]
+
+
+async def set_free_limit_count(count: int) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["free_limit_count"] = count
+        _save_data(data)
 
 
 async def is_premium_enabled() -> bool:
