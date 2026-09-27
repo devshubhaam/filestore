@@ -28,13 +28,17 @@ Optional:
 import os
 import json
 import html
+import uuid
+import random
 import hashlib
 import logging
 import pathlib
 import asyncio
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,48 @@ def _get_settings(data: dict) -> dict:
     pm.setdefault("button_url", None)
     settings.setdefault("free_limit_enabled", False)
     settings.setdefault("free_limit_count", 5)
+
+    # Link shorteners (admin-only). Multiple can be added; one is picked
+    # at random for every verification link, so if one service is down
+    # the others keep working.
+    settings.setdefault("shorteners", [])
+
+    # Token verification — required for free (non-premium) users before
+    # they can open a file link. Disabled by default.
+    tv = settings.setdefault("token_verification", {})
+    tv.setdefault("enabled", False)
+    tv.setdefault("validity_hours", 24)
+
+    # Force subscribe — user must join every listed channel/group first.
+    fs = settings.setdefault("force_subscribe", {})
+    fs.setdefault("enabled", False)
+    fs.setdefault("channels", [])
+
+    # Custom caption applied to every file post.
+    cap = settings.setdefault("caption", {})
+    cap.setdefault("enabled", False)
+    cap.setdefault("template", None)
+
+    # Custom thumbnail applied to every file post.
+    thumb = settings.setdefault("thumbnail", {})
+    thumb.setdefault("enabled", False)
+    thumb.setdefault("file_id", None)
+
+    # Custom inline button attached under every file post.
+    btn = settings.setdefault("button", {})
+    btn.setdefault("enabled", False)
+    btn.setdefault("label", None)
+    btn.setdefault("url", None)
+
+    # Auto delete: remove the sent file message after N seconds.
+    ad = settings.setdefault("auto_delete", {})
+    ad.setdefault("enabled", False)
+    ad.setdefault("seconds", 600)
+
+    # Protect content: stop users from forwarding/saving sent files.
+    pc = settings.setdefault("protect_content", {})
+    pc.setdefault("enabled", False)
+
     return settings
 
 
@@ -276,6 +322,332 @@ async def get_referral_stats(referrer_id: int) -> dict:
                 if rec.get("rewarded"):
                     rewarded += 1
         return {"total": total, "rewarded": rewarded}
+
+
+# --------------------------------------------------------------------------
+# Link shorteners (admin-only, multiple)
+# data["settings"]["shorteners"] = [
+#     {"id": "a1b2c3d4", "name": "GPLinks", "api_domain": "api.gplinks.com",
+#      "api_key": "...", "enabled": True}, ...
+# ]
+# --------------------------------------------------------------------------
+
+async def list_shorteners() -> list[dict]:
+    async with DATA_LOCK:
+        data = _load_data()
+        return list(_get_settings(data)["shorteners"])
+
+
+async def add_shortener(name: str, api_domain: str, api_key: str) -> dict:
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "name": name,
+        "api_domain": api_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/"),
+        "api_key": api_key.strip(),
+        "enabled": True,
+    }
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["shorteners"].append(entry)
+        _save_data(data)
+    return entry
+
+
+async def remove_shortener(shortener_id: str) -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        shorteners = _get_settings(data)["shorteners"]
+        new_list = [s for s in shorteners if s["id"] != shortener_id]
+        if len(new_list) == len(shorteners):
+            return False
+        _get_settings(data)["shorteners"] = new_list
+        _save_data(data)
+        return True
+
+
+async def toggle_shortener(shortener_id: str) -> bool | None:
+    """Flips a shortener's enabled flag. Returns the new state, or None
+    if no shortener with that id exists."""
+    async with DATA_LOCK:
+        data = _load_data()
+        for s in _get_settings(data)["shorteners"]:
+            if s["id"] == shortener_id:
+                s["enabled"] = not s["enabled"]
+                _save_data(data)
+                return s["enabled"]
+        return None
+
+
+async def shorten_url(long_url: str) -> str:
+    """Shortens `long_url` with a randomly-picked enabled shortener
+    (GPLinks-style API: GET https://<domain>/api?api=<key>&url=<url>
+    -> {"status": "success", "shortenedUrl": "..."}). Falls back to the
+    original long_url if none are configured or the request fails, so
+    the bot degrades gracefully instead of blocking users."""
+    shorteners = [s for s in await list_shorteners() if s.get("enabled")]
+    if not shorteners:
+        return long_url
+    chosen = random.choice(shorteners)
+    try:
+        api_url = (
+            f"https://{chosen['api_domain']}/api"
+            f"?api={chosen['api_key']}&url={quote(long_url, safe='')}"
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                result = await resp.json(content_type=None)
+                short = result.get("shortenedUrl") or result.get("shortened_url")
+                if result.get("status") == "success" and short:
+                    return short
+                logger.warning("Shortener %s returned no link: %s", chosen.get("name"), result)
+    except Exception:
+        logger.exception("Shortener %s failed", chosen.get("name"))
+    return long_url
+
+
+# --------------------------------------------------------------------------
+# Token verification (free users only)
+# data["verified"] = {user_id_str: expiry_iso}
+# --------------------------------------------------------------------------
+
+async def is_token_verification_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["token_verification"]["enabled"]
+
+
+async def set_token_verification_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["token_verification"]["enabled"] = value
+        _save_data(data)
+
+
+async def get_verification_validity_hours() -> int:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["token_verification"]["validity_hours"]
+
+
+async def set_verification_validity_hours(hours: int) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["token_verification"]["validity_hours"] = hours
+        _save_data(data)
+
+
+async def is_verified(user_id: int) -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        expiry = data.get("verified", {}).get(str(user_id))
+    if not expiry:
+        return False
+    try:
+        return datetime.fromisoformat(expiry) > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+async def set_verified(user_id: int, hours: int) -> str:
+    expiry = datetime.now(timezone.utc) + timedelta(hours=hours)
+    async with DATA_LOCK:
+        data = _load_data()
+        data.setdefault("verified", {})[str(user_id)] = expiry.isoformat()
+        _save_data(data)
+    return expiry.isoformat()
+
+
+# --------------------------------------------------------------------------
+# Force subscribe
+# --------------------------------------------------------------------------
+
+async def is_force_sub_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["force_subscribe"]["enabled"]
+
+
+async def set_force_sub_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["force_subscribe"]["enabled"] = value
+        _save_data(data)
+
+
+async def list_force_sub_channels() -> list[dict]:
+    async with DATA_LOCK:
+        data = _load_data()
+        return list(_get_settings(data)["force_subscribe"]["channels"])
+
+
+async def add_force_sub_channel(chat_id: int, title: str, invite_link: str,
+                                 username: str | None = None) -> dict:
+    entry = {
+        "entry_id": uuid.uuid4().hex[:8],
+        "id": chat_id,
+        "title": title,
+        "username": username,
+        "invite_link": invite_link,
+    }
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["force_subscribe"]["channels"].append(entry)
+        _save_data(data)
+    return entry
+
+
+async def remove_force_sub_channel(entry_id: str) -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        channels = _get_settings(data)["force_subscribe"]["channels"]
+        new_list = [c for c in channels if c["entry_id"] != entry_id]
+        if len(new_list) == len(channels):
+            return False
+        _get_settings(data)["force_subscribe"]["channels"] = new_list
+        _save_data(data)
+        return True
+
+
+async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
+    """Returns the force-subscribe channels `user_id` has NOT joined.
+    If membership can't be checked (bot isn't admin there, etc.) that
+    channel is skipped rather than blocking the user, so a misconfigured
+    channel doesn't lock everyone out."""
+    if not await is_force_sub_enabled():
+        return []
+    channels = await list_force_sub_channels()
+    unjoined = []
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
+            if member.status in ("left", "kicked"):
+                unjoined.append(ch)
+        except Exception:
+            logger.warning("Could not check force-sub membership for channel %s", ch.get("id"))
+    return unjoined
+
+
+# --------------------------------------------------------------------------
+# Custom caption / thumbnail / button / auto-delete / protect content
+# --------------------------------------------------------------------------
+
+async def is_caption_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["caption"]["enabled"]
+
+
+async def set_caption_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["caption"]["enabled"] = value
+        _save_data(data)
+
+
+async def get_caption_template() -> str | None:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["caption"]["template"]
+
+
+async def set_caption_template(template: str) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["caption"]["template"] = template
+        _save_data(data)
+
+
+async def is_thumbnail_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["thumbnail"]["enabled"]
+
+
+async def set_thumbnail_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["thumbnail"]["enabled"] = value
+        _save_data(data)
+
+
+async def get_thumbnail_file_id() -> str | None:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["thumbnail"]["file_id"]
+
+
+async def set_thumbnail_file_id(file_id: str | None) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["thumbnail"]["file_id"] = file_id
+        _save_data(data)
+
+
+async def is_custom_button_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["button"]["enabled"]
+
+
+async def set_custom_button_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["button"]["enabled"] = value
+        _save_data(data)
+
+
+async def get_custom_button() -> dict:
+    async with DATA_LOCK:
+        data = _load_data()
+        return dict(_get_settings(data)["button"])
+
+
+async def set_custom_button(label: str, url: str) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        btn = _get_settings(data)["button"]
+        btn["label"] = label
+        btn["url"] = url
+        _save_data(data)
+
+
+async def is_auto_delete_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["auto_delete"]["enabled"]
+
+
+async def set_auto_delete_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["auto_delete"]["enabled"] = value
+        _save_data(data)
+
+
+async def get_auto_delete_seconds() -> int:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["auto_delete"]["seconds"]
+
+
+async def set_auto_delete_seconds(seconds: int) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["auto_delete"]["seconds"] = seconds
+        _save_data(data)
+
+
+async def is_protect_content_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["protect_content"]["enabled"]
+
+
+async def set_protect_content_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["protect_content"]["enabled"] = value
+        _save_data(data)
 
 
 # --------------------------------------------------------------------------
