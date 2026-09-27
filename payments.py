@@ -43,7 +43,7 @@ PAYU_SALT = os.environ.get("PAYU_SALT", "")
 PAYU_MODE = os.environ.get("PAYU_MODE", "test").lower()
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-PLAN_AMOUNT = os.environ.get("PLAN_AMOUNT", "1")
+PLAN_AMOUNT = os.environ.get("PLAN_AMOUNT", "10")
 PLAN_DAYS = int(os.environ.get("PLAN_DAYS", "30"))
 PLAN_LABEL = os.environ.get("PLAN_LABEL", "Premium Plan")
 
