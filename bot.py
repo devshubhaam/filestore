@@ -14,11 +14,15 @@ Run: BOT_TOKEN="your-token-here" python bot.py
 """
 
 import os
+import uuid
 import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from aiohttp import web
+
+import payments
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -170,6 +174,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+
+    if query.data in ("help_settings", "help_about"):
+        # Just display for now — not wired up to real logic yet.
+        await query.answer(text="Yeh feature jaldi aa raha hai 🚧", show_alert=True)
+        return
+
     await query.answer()
 
     if query.data == "help":
@@ -195,34 +205,85 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.HTML,
             reply_markup=build_start_keyboard(),
         )
-    elif query.data in ("help_settings", "help_about"):
-        # Just display for now — not wired up to real logic yet.
-        await query.answer(text="Yeh feature jaldi aa raha hai 🚧", show_alert=True)
 
 
-def main() -> None:
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+        await update.message.reply_text(
+            "⚠️ Payment gateway isn't configured yet. Set PAYU_KEY, "
+            "PAYU_SALT and BASE_URL environment variables first."
+        )
+        return
+
+    txnid = uuid.uuid4().hex[:20]
+    txn = {
+        "user_id": user.id,
+        "chat_id": chat_id,
+        "amount": payments.PLAN_AMOUNT,
+        "plan_days": payments.PLAN_DAYS,
+        "plan_label": payments.PLAN_LABEL,
+        "firstname": user.first_name or "User",
+        "email": f"user{user.id}@telegram.local",
+        "phone": "9999999999",
+        "status": "pending",
+    }
+    await payments.save_transaction(txnid, txn)
+
+    pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"💳 Pay ₹{payments.PLAN_AMOUNT} now", url=pay_url)]]
+    )
+    text = (
+        to_bold_unicode(f"{payments.PLAN_LABEL} - ₹{payments.PLAN_AMOUNT}") + "\n\n"
+        + to_bold_unicode(f"Valid for {payments.PLAN_DAYS} days.") + "\n\n"
+        + "Tap the button below to pay — UPI (opens your UPI app), UPI QR, "
+        "cards, netbanking and wallets are all available on the payment page."
+    )
+    await update.message.reply_text(text=text, reply_markup=keyboard)
+
+
+async def main() -> None:
     if BOT_TOKEN == "PUT-YOUR-BOT-TOKEN-HERE":
         raise SystemExit(
             "Set your bot token first: export BOT_TOKEN='123456:ABC-DEF...'"
         )
 
-    # Python 3.14 removed the implicit auto-creation of an event loop in the
-    # main thread. python-telegram-bot's run_polling() still calls
-    # asyncio.get_event_loop() internally, so we create and set one explicitly
-    # here to stay compatible across Python versions.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("buy", buy))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # --- Telegram bot: start polling (manual lifecycle, not the blocking
+    # run_polling() helper, so it can run alongside the aiohttp server in
+    # the same asyncio loop) ---
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    me = await application.bot.get_me()
+    logger.info("Bot @%s started (polling)", me.username)
+
+    # --- PayU webhook / checkout HTTP server ---
+    web_app = payments.build_web_app(application.bot)
+    web_app["bot_username"] = me.username
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("PayU webhook server listening on port %s", port)
+
+    try:
+        await asyncio.Event().wait()  # run forever
+    finally:
+        await runner.cleanup()
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
