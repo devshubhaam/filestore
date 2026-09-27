@@ -14,6 +14,7 @@ Run: BOT_TOKEN="your-token-here" python bot.py
 """
 
 import os
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -90,6 +91,15 @@ def main() -> None:
         raise SystemExit(
             "Set your bot token first: export BOT_TOKEN='123456:ABC-DEF...'"
         )
+
+    # Python 3.14 removed the implicit auto-creation of an event loop in the
+    # main thread. python-telegram-bot's run_polling() still calls
+    # asyncio.get_event_loop() internally, so we create and set one explicitly
+    # here to stay compatible across Python versions.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     application = Application.builder().token(BOT_TOKEN).build()
 
