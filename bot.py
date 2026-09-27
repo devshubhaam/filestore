@@ -17,7 +17,7 @@ import os
 import uuid
 import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from aiohttp import web
@@ -238,10 +238,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(
-            f"💳 Pay ₹{payments.PLAN_AMOUNT} now",
-            web_app=WebAppInfo(url=pay_url),
-        )]]
+        [[InlineKeyboardButton(f"💳 Pay ₹{payments.PLAN_AMOUNT} now", url=pay_url)]]
     )
     text = (
         "💎 " + to_bold_unicode(f"{payments.PLAN_LABEL} - ₹{payments.PLAN_AMOUNT}")
