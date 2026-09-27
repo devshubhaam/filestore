@@ -114,6 +114,142 @@ async def is_premium(user_id: int) -> bool:
         return False
 
 
+async def grant_premium_days(user_id: int, days: int) -> str:
+    """Adds `days` on top of a user's current premium (extending an active
+    plan, or starting fresh from now if they have none/expired). Returns
+    the new expiry ISO string."""
+    async with DATA_LOCK:
+        data = _load_data()
+        now = datetime.now(timezone.utc)
+        base = now
+        existing = data.get("premium", {}).get(str(user_id))
+        if existing:
+            try:
+                exp_dt = datetime.fromisoformat(existing)
+                if exp_dt > now:
+                    base = exp_dt
+            except Exception:
+                pass
+        new_expiry = base + timedelta(days=days)
+        data.setdefault("premium", {})[str(user_id)] = new_expiry.isoformat()
+        _save_data(data)
+        return new_expiry.isoformat()
+
+
+def _get_settings(data: dict) -> dict:
+    settings = data.setdefault("settings", {})
+    settings.setdefault("premium_enabled", True)
+    pm = settings.setdefault("premium_message", {})
+    pm.setdefault("text", None)
+    pm.setdefault("photo_file_id", None)
+    pm.setdefault("button_text", None)
+    pm.setdefault("button_url", None)
+    return settings
+
+
+async def is_premium_enabled() -> bool:
+    async with DATA_LOCK:
+        data = _load_data()
+        return _get_settings(data)["premium_enabled"]
+
+
+async def set_premium_enabled(value: bool) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        _get_settings(data)["premium_enabled"] = value
+        _save_data(data)
+
+
+async def get_premium_message() -> dict:
+    async with DATA_LOCK:
+        data = _load_data()
+        return dict(_get_settings(data)["premium_message"])
+
+
+async def set_premium_message(**fields) -> None:
+    """Updates one or more fields of the custom premium-plan message
+    (text, photo_file_id, button_text, button_url)."""
+    async with DATA_LOCK:
+        data = _load_data()
+        pm = _get_settings(data)["premium_message"]
+        pm.update(fields)
+        _save_data(data)
+
+
+async def list_premium() -> dict:
+    """Returns {user_id_str: expiry_iso} for every user ever granted
+    premium (including expired ones)."""
+    async with DATA_LOCK:
+        data = _load_data()
+        return dict(data.get("premium", {}))
+
+
+async def remove_premium(user_id: int) -> bool:
+    """Removes a user from the premium store. Returns True if they were
+    present, False if they weren't premium to begin with."""
+    async with DATA_LOCK:
+        data = _load_data()
+        key = str(user_id)
+        if key in data.get("premium", {}):
+            del data["premium"][key]
+            _save_data(data)
+            return True
+        return False
+
+
+# --------------------------------------------------------------------------
+# Refer & Earn
+# data["referrals"] = {referred_user_id_str: {"referrer_id": int, "rewarded": bool}}
+# --------------------------------------------------------------------------
+
+async def record_referral(referred_id: int, referrer_id: int) -> bool:
+    """Called the first time a referred user starts the bot. Returns True
+    if this referral was newly recorded, False if that user already has a
+    referrer on file (or referred == referrer)."""
+    if referred_id == referrer_id:
+        return False
+    async with DATA_LOCK:
+        data = _load_data()
+        referrals = data.setdefault("referrals", {})
+        key = str(referred_id)
+        if key in referrals:
+            return False
+        referrals[key] = {"referrer_id": referrer_id, "rewarded": False}
+        _save_data(data)
+        return True
+
+
+async def get_referral(referred_id: int) -> dict | None:
+    async with DATA_LOCK:
+        data = _load_data()
+        return data.get("referrals", {}).get(str(referred_id))
+
+
+async def mark_referral_rewarded(referred_id: int) -> None:
+    async with DATA_LOCK:
+        data = _load_data()
+        rec = data.get("referrals", {}).get(str(referred_id))
+        if rec:
+            rec["rewarded"] = True
+            _save_data(data)
+
+
+async def get_referral_stats(referrer_id: int) -> dict:
+    """Returns {"total": n, "rewarded": n} for everyone a user has
+    referred so far."""
+    async with DATA_LOCK:
+        data = _load_data()
+        referrals = data.get("referrals", {})
+        total = 0
+        rewarded = 0
+        for rec in referrals.values():
+            if rec.get("referrer_id") == referrer_id:
+                total += 1
+                if rec.get("rewarded"):
+                    rewarded += 1
+        return {"total": total, "rewarded": rewarded}
+
+
 # --------------------------------------------------------------------------
 # PayU hashing
 # --------------------------------------------------------------------------
@@ -188,6 +324,30 @@ async def process_payu_response(params: dict, bot) -> tuple[bool, str]:
             )
         except Exception:
             logger.exception("Could not notify user %s", txn["user_id"])
+
+        # Refer & Earn: if this buyer was referred and hasn't triggered a
+        # reward yet, give the referrer 1 free day of premium.
+        try:
+            referral = await get_referral(txn["user_id"])
+            if referral and not referral.get("rewarded"):
+                referrer_id = referral["referrer_id"]
+                new_expiry = await grant_premium_days(referrer_id, 1)
+                await mark_referral_rewarded(txn["user_id"])
+                try:
+                    await bot.send_message(
+                        chat_id=referrer_id,
+                        text=(
+                            "🎁 Your referral just purchased Premium! You've "
+                            "earned +1 day of Premium.\n"
+                            f"Your premium is now valid until "
+                            f"{datetime.fromisoformat(new_expiry).strftime('%d %b %Y')}."
+                        ),
+                    )
+                except Exception:
+                    logger.exception("Could not notify referrer %s", referrer_id)
+        except Exception:
+            logger.exception("Referral reward check failed for user %s", txn["user_id"])
+
         return True, "success"
     else:
         txn["status"] = "failed"
