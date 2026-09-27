@@ -134,6 +134,46 @@ def build_help_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def build_settings_text() -> str:
+    header = "⚙️ <u>" + to_bold_unicode("Settings:") + "</u>"
+    note1 = (
+        "<blockquote>" + to_bold_unicode("Customize your settings as per your need.") + "</blockquote>"
+    )
+    note2 = (
+        "<blockquote>"
+        + to_bold_unicode(
+            "Note: The settings below will only work for links created by "
+            "this Telegram account. They will not affect links created by "
+            "other accounts."
+        )
+        + "</blockquote>"
+    )
+    return "\n\n".join([header, note1, note2])
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("💎 Premium plan", callback_data="settings_premium")],
+        [InlineKeyboardButton("🆓 Free usage limit", callback_data="settings_free_limit")],
+        [InlineKeyboardButton("🌍 Refer and earn", callback_data="settings_refer")],
+        [InlineKeyboardButton("🔗 Link shortner", callback_data="settings_link_shortener")],
+        [InlineKeyboardButton("⏰ Token verification", callback_data="settings_token_verification")],
+        [InlineKeyboardButton("📢 Force subscribe", callback_data="settings_force_subscribe")],
+        [
+            InlineKeyboardButton("🍿 Caption", callback_data="settings_caption"),
+            InlineKeyboardButton("🖼 Thumbnail", callback_data="settings_thumbnail"),
+        ],
+        [
+            InlineKeyboardButton("⚪ Button", callback_data="settings_button"),
+            InlineKeyboardButton("♻️ Auto delete", callback_data="settings_auto_delete"),
+        ],
+        [InlineKeyboardButton("♾️ Permanent link", callback_data="settings_permanent_link")],
+        [InlineKeyboardButton("🔒 Protect content", callback_data="settings_protect_content")],
+        [InlineKeyboardButton("◀ Back", callback_data="settings_back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def build_start_text(user_first_name: str) -> str:
     # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
     # characters, so only <blockquote> (structural, not styling) needs HTML.
@@ -176,10 +216,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+SETTINGS_PLACEHOLDER_CALLBACKS = {
+    "settings_free_limit",
+    "settings_refer",
+    "settings_link_shortener",
+    "settings_token_verification",
+    "settings_force_subscribe",
+    "settings_caption",
+    "settings_thumbnail",
+    "settings_button",
+    "settings_auto_delete",
+    "settings_permanent_link",
+    "settings_protect_content",
+}
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
-    if query.data in ("help_settings", "help_about"):
+    if query.data in ("help_settings", "help_about") or query.data in SETTINGS_PLACEHOLDER_CALLBACKS:
         # Just display for now — not wired up to real logic yet.
         await query.answer(text="Yeh feature jaldi aa raha hai 🚧", show_alert=True)
         return
@@ -199,8 +254,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     elif query.data == "settings":
         await query.edit_message_text(
-            text=to_bold_unicode("Settings") + "\n\n"
-                 "(configure your preferences here)",
+            text=build_settings_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_settings_keyboard(),
+        )
+    elif query.data == "settings_premium":
+        user = update.effective_user
+        offer = await build_buy_offer(user, update.effective_chat.id)
+        if offer is None:
+            await query.edit_message_text(
+                text="⚠️ Payment gateway isn't configured yet."
+            )
+            return
+        text, keyboard = offer
+        await query.edit_message_text(
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    elif query.data == "settings_back":
+        user = update.effective_user
+        await query.edit_message_text(
+            text=build_start_text(user.first_name),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_start_keyboard(),
         )
     elif query.data == "help_back":
         user = update.effective_user
@@ -211,16 +288,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-
+async def build_buy_offer(user, chat_id) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Creates a pending PayU transaction and returns (text, keyboard) for
+    the buy offer message. Returns None if PayU isn't configured."""
     if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
-        await update.message.reply_text(
-            "⚠️ Payment gateway isn't configured yet. Set PAYU_KEY, "
-            "PAYU_SALT and BASE_URL environment variables first."
-        )
-        return
+        return None
 
     txnid = uuid.uuid4().hex[:20]
     txn = {
@@ -252,6 +324,22 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + "</blockquote>\n\n"
         + to_bold_unicode("Tap the button below to pay.")
     )
+    return text, keyboard
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    offer = await build_buy_offer(user, chat_id)
+    if offer is None:
+        await update.message.reply_text(
+            "⚠️ Payment gateway isn't configured yet. Set PAYU_KEY, "
+            "PAYU_SALT and BASE_URL environment variables first."
+        )
+        return
+
+    text, keyboard = offer
     await update.message.reply_text(
         text=text,
         parse_mode=ParseMode.HTML,
