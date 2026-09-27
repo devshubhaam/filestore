@@ -1099,6 +1099,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     # --------------------------------------------------------------------
 
+    # ---------------- Buy / extend premium plan ----------------
+    if data.startswith("buyplan_"):
+        plan_id = data[len("buyplan_"):]
+        offer = await build_buy_offer(user, update.effective_chat.id, plan_id)
+        if offer is None:
+            await query.answer()
+            await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
+            return
+        if offer == "disabled":
+            await query.answer()
+            await query.edit_message_text(
+                text="🚫 Premium plan purchases are currently unavailable. "
+                     "Please check back later."
+            )
+            return
+        if offer == "invalid_plan":
+            await query.answer("⚠️ Invalid plan.", show_alert=True)
+            return
+        await query.answer()
+        if offer["photo_file_id"]:
+            # Editing text -> photo isn't possible, so send a fresh
+            # message when a custom picture is configured.
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=offer["photo_file_id"],
+                caption=offer["text"],
+                parse_mode=ParseMode.HTML,
+                reply_markup=offer["keyboard"],
+            )
+        else:
+            await query.edit_message_text(
+                text=offer["text"],
+                parse_mode=ParseMode.HTML,
+                reply_markup=offer["keyboard"],
+            )
+        return
+    # --------------------------------------------------------------------
+
     # ---------------- Premium admin panel (admin-only) ----------------
     if data == "premium_users_list":
         if not is_admin(user.id):
@@ -1294,22 +1332,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=build_premium_menu_keyboard(enabled),
             )
             return
-        offer = await build_buy_offer(user, update.effective_chat.id)
-        if offer is None:
+        if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
             await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
             return
-        if offer == "disabled":
+        if not await payments.is_premium_enabled():
             await query.edit_message_text(
                 text="🚫 Premium plan purchases are currently unavailable. "
                      "Please check back later."
             )
             return
-        # Editing a text message can't turn it into a photo message, so a
-        # custom picture (if set) is shown for /buy but not from here.
+        already_premium = await payments.is_premium(user.id)
+        expiry_iso = await payments.get_premium_expiry(user.id) if already_premium else None
         await query.edit_message_text(
-            text=offer["text"],
+            text=build_plan_choice_text(already_premium, expiry_iso),
             parse_mode=ParseMode.HTML,
-            reply_markup=offer["keyboard"],
+            reply_markup=build_plan_choice_keyboard(),
         )
     elif data == "premium_back":
         await query.edit_message_text(
@@ -1359,24 +1396,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def build_buy_offer(user, chat_id):
-    """Creates a pending PayU transaction and returns a dict describing
-    the buy offer message: {"text", "keyboard", "photo_file_id"}.
-    Returns None if PayU isn't configured, or the string "disabled" if
-    an admin has turned premium purchases off."""
+def build_plan_choice_text(already_premium: bool, expiry_iso: str | None) -> str:
+    header = "💎 <u>" + to_bold_unicode("Premium Plan:") + "</u>"
+    if already_premium and expiry_iso:
+        expiry = datetime.fromisoformat(expiry_iso)
+        notice = (
+            "<blockquote>"
+            + "✅ " + to_bold_unicode("Aap already Premium user hain!") + "\n"
+            + "⏳ " + to_bold_unicode(f"Expires on: {expiry.strftime('%d %b %Y, %H:%M UTC')}") + "\n"
+            + "🔄 " + to_bold_unicode("Chahen to niche se plan lekar Extend kar sakte hain — naya time abhi wali expiry ke upar jud jayega.")
+            + "</blockquote>"
+        )
+    else:
+        notice = (
+            "<blockquote>"
+            + to_bold_unicode(
+                "Premium Plan: ad-free access, faster downloads, and "
+                "exclusive entry to restricted files or groups."
+            )
+            + "</blockquote>"
+        )
+    return f"{header}\n\n{notice}"
+
+
+def build_plan_choice_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(f"💳 {p['label']} - ₹{p['amount']}", callback_data=f"buyplan_{p['id']}")]
+        for p in payments.PLANS
+    ]
+    keyboard.append([InlineKeyboardButton("◀ Back", callback_data="settings")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def build_buy_offer(user, chat_id, plan_id: str):
+    """Creates a pending PayU transaction for the chosen plan and returns
+    a dict describing the buy offer message: {"text", "keyboard",
+    "photo_file_id"}. Returns None if PayU isn't configured, "disabled"
+    if an admin has turned premium purchases off, or "invalid_plan" if
+    plan_id doesn't match any configured plan."""
     if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
         return None
 
     if not await payments.is_premium_enabled():
         return "disabled"
 
+    plan = payments.get_plan(plan_id)
+    if plan is None:
+        return "invalid_plan"
+
     txnid = uuid.uuid4().hex[:20]
     txn = {
         "user_id": user.id,
         "chat_id": chat_id,
-        "amount": payments.PLAN_AMOUNT,
-        "plan_days": payments.PLAN_DAYS,
-        "plan_label": payments.PLAN_LABEL,
+        "amount": plan["amount"],
+        "plan_days": plan["days"],
+        "plan_label": f"{payments.PLAN_LABEL} - {plan['label']}",
         "firstname": user.first_name or "User",
         "email": f"user{user.id}@telegram.local",
         "phone": "9999999999",
@@ -1385,23 +1459,24 @@ async def build_buy_offer(user, chat_id):
     await payments.save_transaction(txnid, txn)
 
     pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
-    buttons = [[InlineKeyboardButton(f"💳 Pay ₹{payments.PLAN_AMOUNT} now", url=pay_url)]]
+    buttons = [[InlineKeyboardButton(f"💳 Pay ₹{plan['amount']} now", url=pay_url)]]
 
     custom = await payments.get_premium_message()
     if custom.get("button_text") and custom.get("button_url"):
         buttons.append(
             [InlineKeyboardButton(custom["button_text"], url=custom["button_url"])]
         )
+    buttons.append([InlineKeyboardButton("◀ Back", callback_data="settings_premium")])
     keyboard = InlineKeyboardMarkup(buttons)
 
     if custom.get("text"):
         text = custom["text"]
     else:
         text = (
-            "💎 " + to_bold_unicode(f"{payments.PLAN_LABEL} - ₹{payments.PLAN_AMOUNT}")
+            "💎 " + to_bold_unicode(f"{plan['label']} - ₹{plan['amount']}")
             + "\n\n"
             + "<blockquote>"
-            + "⏳ " + to_bold_unicode(f"Valid for {payments.PLAN_DAYS} days.") + "\n"
+            + "⏳ " + to_bold_unicode(f"Valid for {plan['days']} day(s).") + "\n"
             + "💳 " + to_bold_unicode(
                 "Pay via UPI, UPI QR, cards, netbanking or wallet — all shown "
                 "on the payment page."
@@ -1419,35 +1494,27 @@ async def build_buy_offer(user, chat_id):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    chat_id = update.effective_chat.id
 
-    offer = await build_buy_offer(user, chat_id)
-    if offer is None:
+    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
         await update.message.reply_text(
             "⚠️ Payment gateway isn't configured yet. Set PAYU_KEY, "
             "PAYU_SALT and BASE_URL environment variables first."
         )
         return
-    if offer == "disabled":
+    if not await payments.is_premium_enabled():
         await update.message.reply_text(
             "🚫 Premium plan purchases are currently unavailable. Please "
             "check back later."
         )
         return
 
-    if offer["photo_file_id"]:
-        await update.message.reply_photo(
-            photo=offer["photo_file_id"],
-            caption=offer["text"],
-            parse_mode=ParseMode.HTML,
-            reply_markup=offer["keyboard"],
-        )
-    else:
-        await update.message.reply_text(
-            text=offer["text"],
-            parse_mode=ParseMode.HTML,
-            reply_markup=offer["keyboard"],
-        )
+    already_premium = await payments.is_premium(user.id)
+    expiry_iso = await payments.get_premium_expiry(user.id) if already_premium else None
+    await update.message.reply_text(
+        text=build_plan_choice_text(already_premium, expiry_iso),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_plan_choice_keyboard(),
+    )
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1467,7 +1534,8 @@ async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         expiry = datetime.fromisoformat(expiry_iso)
         text = (
             "💎 " + to_bold_unicode("You have an active premium plan.") + "\n"
-            + "⏳ " + to_bold_unicode(f"Expires on: {expiry.strftime('%d %b %Y, %H:%M UTC')}")
+            + "⏳ " + to_bold_unicode(f"Expires on: {expiry.strftime('%d %b %Y, %H:%M UTC')}") + "\n"
+            + "🔄 " + to_bold_unicode("Use /buy to extend it further.")
         )
     else:
         text = (
