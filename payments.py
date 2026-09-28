@@ -52,6 +52,37 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
 PLAN_LABEL = os.environ.get("PLAN_LABEL", "Premium Plan")
 
+# Optional: direct https URL of your own ringtone (mp3/ogg/wav) to play on
+# the payment-success page. If empty, a built-in synthesized chime is used.
+SUCCESS_SOUND_URL = os.environ.get("SUCCESS_SOUND_URL", "").strip()
+
+# Files placed in the `assets/` folder next to this file are served at
+# /assets/<name>. A file named success.mp3 (or .ogg/.wav/.m4a) there is
+# picked up automatically as the success ringtone.
+ASSETS_DIR = pathlib.Path(__file__).parent / "assets"
+_SOUND_EXTS = (".mp3", ".ogg", ".wav", ".m4a")
+
+
+def _resolve_asset(name: str) -> pathlib.Path | None:
+    """Returns the real path of an audio file inside assets/, or None.
+    Blocks path traversal and non-audio files."""
+    if not name or name != pathlib.Path(name).name or not name.lower().endswith(_SOUND_EXTS):
+        return None
+    path = (ASSETS_DIR / name).resolve()
+    if ASSETS_DIR.resolve() not in path.parents or not path.is_file():
+        return None
+    return path
+
+
+def _bundled_sound_url() -> str:
+    """Public URL of assets/success.<ext> if one exists, else ''."""
+    if not BASE_URL:
+        return ""
+    for ext in _SOUND_EXTS:
+        if _resolve_asset(f"success{ext}"):
+            return f"{BASE_URL}/assets/success{ext}"
+    return ""
+
 # Multiple premium plan tiers. `id` is used in callback_data, so keep it
 # short and stable — changing an existing id will orphan any pending
 # transactions using the old one (harmless, they just expire unused).
@@ -883,41 +914,94 @@ async def handle_webhook(request: web.Request) -> web.Response:
     return web.Response(text="OK" if ok else f"ERR: {msg}")
 
 
-def _status_page(success: bool, heading: str, subtitle: str, link: str, button_label: str) -> str:
-    """Renders a self-contained, animated payment-result page (green
-    check-in-circle for success, red cross for failure) with a button
-    back to the bot."""
-    accent = "#22c55e" if success else "#ef4444"
-    accent_dark = "#16a34a" if success else "#dc2626"
-    glow = "rgba(34,197,94,0.35)" if success else "rgba(239,68,68,0.35)"
-    icon_svg = (
-        # Checkmark
-        '<path class="icon-path" d="M28 52 L44 68 L76 32" fill="none" '
-        'stroke="#ffffff" stroke-width="8" stroke-linecap="round" '
-        'stroke-linejoin="round"/>'
-        if success else
-        # Cross
-        '<path class="icon-path" d="M34 34 L66 66 M66 34 L34 66" fill="none" '
-        'stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>'
-    )
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>{html.escape(heading)}</title>
-<style>
-  :root {{
-    --accent: {accent};
-    --accent-dark: {accent_dark};
-    --glow: {glow};
-  }}
-  * {{ box-sizing: border-box; }}
-  html, body {{
-    height: 100%;
-    margin: 0;
-  }}
-  body {{
+# --------------------------------------------------------------------------
+# Payment result pages
+#
+# Success page flow: the page first shows a "Check Payment Status" button.
+# Tapping it (a real user gesture, so browsers allow audio) starts a short
+# loading animation, then reveals the green tick and plays the ringtone.
+# NOTE: the payment itself is already verified on the server before this
+# page is rendered — the loading step is a short animation, not a poll.
+# --------------------------------------------------------------------------
+
+_CHIME_JS = """
+function prepareSound(delay) {
+  var Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return function () {};
+  var ctx = new Ctx();
+  if (ctx.resume) ctx.resume();
+  // Rising C-E-G-C chime, scheduled to start exactly when the tick appears.
+  [[523.25, 0.00, 0.7], [659.25, 0.14, 0.7], [783.99, 0.28, 0.7], [1046.5, 0.42, 1.4]]
+    .forEach(function (n) {
+      var o = ctx.createOscillator(), g = ctx.createGain();
+      var t = ctx.currentTime + delay + n[1];
+      o.type = 'sine';
+      o.frequency.value = n[0];
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.4, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + n[2]);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t); o.stop(t + n[2] + 0.05);
+    });
+  return function () {};
+}
+"""
+
+_CUSTOM_SOUND_JS = """
+function prepareSound(delay) {
+  // Started muted inside the tap (always allowed) so the file is loaded
+  // and the element is "unlocked"; restarted audibly when the tick shows.
+  var a = new Audio(__SOUND_URL__);
+  a.preload = 'auto';
+  a.muted = true;
+  try { var p = a.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+  return function () {
+    try {
+      a.pause(); a.currentTime = 0; a.muted = false;
+      var q = a.play(); if (q && q.catch) q.catch(function () {});
+    } catch (e) {}
+  };
+}
+"""
+
+_CHECK_FLOW_JS = """
+(function () {
+  var LOAD_MS = 1800;
+  var btn = document.getElementById('checkBtn');
+  var label = document.getElementById('checkLabel');
+  var busy = false;
+  btn.addEventListener('click', function () {
+    if (busy) return;
+    busy = true;
+    var fire = function () {};
+    try { fire = prepareSound(LOAD_MS / 1000) || fire; } catch (e) {}
+    document.body.classList.add('loading');
+    btn.disabled = true;
+    label.textContent = 'Checking payment\\u2026';
+    setTimeout(function () {
+      document.body.classList.remove('loading');
+      document.body.classList.add('done');
+      try { fire(); } catch (e) {}
+      try { if (navigator.vibrate) navigator.vibrate([80, 60, 80]); } catch (e) {}
+    }, LOAD_MS);
+  });
+})();
+"""
+
+
+def _sound_js(sound_url: str) -> str:
+    """JS defining prepareSound(delaySeconds) -> fire(). Uses the custom
+    file when a URL is given, else the built-in synthesized chime."""
+    if sound_url.startswith(("http://", "https://")):
+        safe_url = json.dumps(sound_url).replace("</", "<\\/")
+        return _CUSTOM_SOUND_JS.replace("__SOUND_URL__", safe_url)
+    return _CHIME_JS
+
+
+_PAGE_CSS_COMMON = """
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
     min-height: 100dvh;
     display: flex;
     align-items: center;
@@ -928,92 +1012,67 @@ def _status_page(success: bool, heading: str, subtitle: str, link: str, button_l
     background: radial-gradient(circle at 50% 20%, #1b2440 0%, #0b0f1f 55%, #05060c 100%);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     color: #f4f6fb;
-  }}
-  .card {{
-    text-align: center;
-    max-width: 420px;
-    width: 100%;
-    animation: fade-up 0.6s ease-out both;
-  }}
-  .icon-wrap {{
-    position: relative;
-    width: 140px;
-    height: 140px;
-    margin: 0 auto 28px;
-  }}
-  .icon-glow {{
-    position: absolute;
-    inset: -20px;
-    border-radius: 50%;
+  }
+  .card { text-align: center; max-width: 420px; width: 100%; animation: fade-up 0.6s ease-out both; }
+  .icon-wrap { position: relative; width: 140px; height: 140px; margin: 0 auto 28px; }
+  .icon-glow {
+    position: absolute; inset: -20px; border-radius: 50%;
     background: radial-gradient(circle, var(--glow) 0%, transparent 70%);
-    filter: blur(6px);
-    animation: pulse 2.2s ease-in-out infinite;
-  }}
-  .icon-circle {{
-    position: relative;
-    width: 140px;
-    height: 140px;
-    border-radius: 50%;
+    filter: blur(6px); animation: pulse 2.2s ease-in-out infinite;
+  }
+  .icon-circle {
+    position: relative; width: 140px; height: 140px; border-radius: 50%;
     background: linear-gradient(145deg, var(--accent) 0%, var(--accent-dark) 100%);
-    box-shadow:
-      0 10px 30px var(--glow),
-      inset 0 -6px 14px rgba(0,0,0,0.25),
-      inset 0 6px 10px rgba(255,255,255,0.25);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    box-shadow: 0 10px 30px var(--glow), inset 0 -6px 14px rgba(0,0,0,0.25), inset 0 6px 10px rgba(255,255,255,0.25);
+    display: flex; align-items: center; justify-content: center;
     animation: pop-in 0.55s cubic-bezier(.34,1.56,.64,1) both;
-  }}
-  .icon-circle svg {{ width: 78px; height: 78px; }}
-  .icon-path {{
-    stroke-dasharray: 100;
-    stroke-dashoffset: 100;
-    animation: draw 0.5s 0.35s ease-out forwards;
-  }}
-  h1 {{
-    font-size: 26px;
-    margin: 0 0 10px;
-    letter-spacing: -0.02em;
-  }}
-  p.subtitle {{
-    font-size: 15px;
-    line-height: 1.5;
-    color: #a9b0c6;
-    margin: 0 0 32px;
-  }}
-  .btn {{
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    color: #ffffff;
-    font-weight: 600;
-    font-size: 16px;
-    padding: 14px 30px;
-    border-radius: 999px;
+  }
+  .icon-circle svg { width: 78px; height: 78px; }
+  .icon-path { stroke-dasharray: 100; stroke-dashoffset: 100; animation: draw 0.5s 0.35s ease-out forwards; }
+  h1 { font-size: 26px; margin: 0 0 10px; letter-spacing: -0.02em; }
+  p.subtitle { font-size: 15px; line-height: 1.5; color: #a9b0c6; margin: 0 0 32px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    text-decoration: none; color: #ffffff; font-weight: 600; font-size: 16px;
+    font-family: inherit; border: 0; cursor: pointer;
+    padding: 14px 30px; border-radius: 999px;
     background: linear-gradient(135deg, #7c6bff 0%, #5b8dff 100%);
     box-shadow: 0 8px 24px rgba(91,141,255,0.35);
-    transition: transform 0.15s ease, box-shadow 0.15s ease;
-  }}
-  .btn:active {{
-    transform: scale(0.96);
-    box-shadow: 0 4px 14px rgba(91,141,255,0.35);
-  }}
-  @keyframes pop-in {{
-    0% {{ transform: scale(0.4); opacity: 0; }}
-    100% {{ transform: scale(1); opacity: 1; }}
-  }}
-  @keyframes draw {{
-    to {{ stroke-dashoffset: 0; }}
-  }}
-  @keyframes pulse {{
-    0%, 100% {{ opacity: 0.55; transform: scale(1); }}
-    50% {{ opacity: 1; transform: scale(1.08); }}
-  }}
-  @keyframes fade-up {{
-    0% {{ opacity: 0; transform: translateY(14px); }}
-    100% {{ opacity: 1; transform: translateY(0); }}
-  }}
+    transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.2s ease;
+  }
+  .btn:active { transform: scale(0.96); box-shadow: 0 4px 14px rgba(91,141,255,0.35); }
+  @keyframes pop-in { 0% { transform: scale(0.4); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  @keyframes pulse { 0%, 100% { opacity: 0.55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.08); } }
+  @keyframes fade-up { 0% { opacity: 0; transform: translateY(14px); } 100% { opacity: 1; transform: translateY(0); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+"""
+
+
+def _status_page(success: bool, heading: str, subtitle: str, link: str,
+                 button_label: str) -> str:
+    """Static result page (used for failed / unconfirmed payments):
+    coloured circle with a tick or cross and a button back to the bot."""
+    accent = "#22c55e" if success else "#ef4444"
+    accent_dark = "#16a34a" if success else "#dc2626"
+    glow = "rgba(34,197,94,0.35)" if success else "rgba(239,68,68,0.35)"
+    icon_svg = (
+        '<path class="icon-path" d="M28 52 L44 68 L76 32" fill="none" '
+        'stroke="#ffffff" stroke-width="8" stroke-linecap="round" '
+        'stroke-linejoin="round"/>'
+        if success else
+        '<path class="icon-path" d="M34 34 L66 66 M66 34 L34 66" fill="none" '
+        'stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>'
+    )
+    page = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>__TITLE__</title>
+<style>
+  :root { --accent: __ACCENT__; --accent-dark: __ACCENT_DARK__; --glow: __GLOW__; }
+__CSS__
 </style>
 </head>
 <body>
@@ -1021,15 +1080,119 @@ def _status_page(success: bool, heading: str, subtitle: str, link: str, button_l
     <div class="icon-wrap">
       <div class="icon-glow"></div>
       <div class="icon-circle">
-        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">{icon_svg}</svg>
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">__ICON__</svg>
       </div>
     </div>
-    <h1>{html.escape(heading)}</h1>
-    <p class="subtitle">{html.escape(subtitle)}</p>
-    <a class="btn" href="{html.escape(link)}">🚀 {html.escape(button_label)}</a>
+    <h1>__TITLE__</h1>
+    <p class="subtitle">__SUBTITLE__</p>
+    <a class="btn" href="__LINK__">🚀 __BUTTON__</a>
   </div>
 </body>
 </html>"""
+    return (page
+            .replace("__CSS__", _PAGE_CSS_COMMON)
+            .replace("__ACCENT_DARK__", accent_dark)
+            .replace("__ACCENT__", accent)
+            .replace("__GLOW__", glow)
+            .replace("__ICON__", icon_svg)
+            .replace("__TITLE__", html.escape(heading))
+            .replace("__SUBTITLE__", html.escape(subtitle))
+            .replace("__LINK__", html.escape(link))
+            .replace("__BUTTON__", html.escape(button_label)))
+
+
+_SUCCESS_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Payment Successful</title>
+<style>
+  /* Before the tap: calm blue. After it: green. */
+  body { --accent: #6d7dff; --accent-dark: #4f5ce6; --glow: rgba(109,125,255,0.35); }
+  body.done { --accent: #22c55e; --accent-dark: #16a34a; --glow: rgba(34,197,94,0.35); }
+__CSS__
+  /* pre = shown before the tap, post = revealed after it */
+  .post { display: none; }
+  body.done .post { display: block; }
+  body.done .icon-circle.post { display: flex; }
+  body.done .pre { display: none; }
+  .icon-circle.pre .icon-path { display: none; }
+  .ring {
+    display: none; position: absolute; inset: -12px; border-radius: 50%;
+    border: 4px solid rgba(124,155,255,0.18); border-top-color: #8fa8ff;
+    animation: spin 0.9s linear infinite;
+  }
+  body.loading .ring { display: block; }
+  .spinner {
+    display: none; width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.4); border-top-color: #ffffff;
+    animation: spin 0.8s linear infinite;
+  }
+  body.loading .spinner { display: inline-block; }
+  .btn:disabled { opacity: 0.85; cursor: default; }
+  .post .btn, .post h1, .post p.subtitle { animation: fade-up 0.5s ease-out both; }
+  .post p.subtitle { animation-delay: 0.08s; }
+  .post .btn { animation-delay: 0.16s; }
+</style>
+<noscript><style>
+  body { --accent: #22c55e; --accent-dark: #16a34a; --glow: rgba(34,197,94,0.35); }
+  .pre, .icon-circle.pre { display: none !important; }
+  .post { display: block !important; }
+  .icon-circle.post { display: flex !important; }
+</style></noscript>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-wrap">
+      <div class="icon-glow"></div>
+      <div class="ring"></div>
+      <div class="icon-circle pre">
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="50" cy="50" r="27" fill="none" stroke="#ffffff" stroke-width="7"/>
+          <path d="M50 35 V50 L61 57" fill="none" stroke="#ffffff" stroke-width="7"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="icon-circle post">
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+          <path class="icon-path" d="M28 52 L44 68 L76 32" fill="none" stroke="#ffffff"
+                stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="pre">
+      <h1>Payment Received</h1>
+      <p class="subtitle">Tap below to check your payment status.</p>
+      <button type="button" class="btn" id="checkBtn">
+        <span class="spinner"></span><span id="checkLabel">🔍 Check Payment Status</span>
+      </button>
+    </div>
+
+    <div class="post">
+      <h1>Payment Successful</h1>
+      <p class="subtitle">__SUBTITLE__</p>
+      <a class="btn" href="__LINK__">🚀 __BUTTON__</a>
+    </div>
+  </div>
+  <script>
+__SOUND_JS__
+__FLOW_JS__
+  </script>
+</body>
+</html>"""
+
+
+def _success_page(subtitle: str, link: str, button_label: str, sound_url: str = "") -> str:
+    """Success page with the tap-to-check flow (see section comment)."""
+    return (_SUCCESS_TEMPLATE
+            .replace("__CSS__", _PAGE_CSS_COMMON)
+            .replace("__SUBTITLE__", html.escape(subtitle))
+            .replace("__LINK__", html.escape(link))
+            .replace("__BUTTON__", html.escape(button_label))
+            .replace("__SOUND_JS__", _sound_js(sound_url))
+            .replace("__FLOW_JS__", _CHECK_FLOW_JS))
 
 
 async def handle_success(request: web.Request) -> web.Response:
@@ -1040,9 +1203,22 @@ async def handle_success(request: web.Request) -> web.Response:
     link = f"https://t.me/{username}" if username else "#"
     success = ok and msg in ("success", "already processed")
 
-    subtitle = "Your premium plan is now active." if success else "We couldn't confirm this payment."
+    if not success:
+        page = _status_page(
+            success=False,
+            heading="Payment Not Confirmed",
+            subtitle=(
+                "We couldn't confirm this payment yet. If money was deducted, "
+                "your plan will activate shortly; otherwise please try again."
+            ),
+            link=link,
+            button_label="Back to Bot",
+        )
+        return web.Response(text=page, content_type="text/html")
+
+    subtitle = "Your premium plan is now active."
     txnid = params.get("txnid")
-    if success and txnid:
+    if txnid:
         txn = await get_transaction(txnid)
         if txn:
             expiry_iso = await get_premium_expiry(txn["user_id"])
@@ -1054,12 +1230,11 @@ async def handle_success(request: web.Request) -> web.Response:
                 except Exception:
                     pass
 
-    page = _status_page(
-        success=success,
-        heading="Payment Successful" if success else "Payment Received",
+    page = _success_page(
         subtitle=subtitle,
         link=link,
         button_label="Back to Bot",
+        sound_url=SUCCESS_SOUND_URL or _bundled_sound_url(),
     )
     return web.Response(text=page, content_type="text/html")
 
@@ -1080,11 +1255,20 @@ async def handle_failure(request: web.Request) -> web.Response:
     return web.Response(text=page, content_type="text/html")
 
 
+async def handle_asset(request: web.Request) -> web.StreamResponse:
+    path = _resolve_asset(request.match_info["name"])
+    if path is None:
+        raise web.HTTPNotFound()
+    # FileResponse supports Range requests, which mobile browsers need for audio.
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
+
+
 def build_web_app(telegram_bot) -> web.Application:
     app = web.Application()
     app["telegram_bot"] = telegram_bot
     app.router.add_get("/", handle_index)
     app.router.add_get("/payu/pay/{txnid}", handle_pay_page)
+    app.router.add_get("/assets/{name}", handle_asset)
     app.router.add_route("*", "/payu/webhook", handle_webhook)
     app.router.add_route("*", "/payu/success", handle_success)
     app.router.add_route("*", "/payu/failure", handle_failure)
