@@ -18,9 +18,12 @@ Required environment variables:
                  e.g. https://your-app.onrender.com
                  (used to build the checkout page link and PayU's
                  success/failure/webhook callback URLs)
+  MONGO_URI    - MongoDB connection string, e.g.
+                 mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/
 
 Optional:
-  PLAN_LABEL   - default "Premium Plan" (brand name shown on the buy card)
+  MONGO_DB_NAME - default "filestore_bot"
+  PLAN_LABEL    - default "Premium Plan" (brand name shown on the buy card)
 """
 
 import os
@@ -37,6 +40,8 @@ from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 import aiohttp
+from pymongo import AsyncMongoClient
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
 
@@ -71,55 +76,181 @@ PAYU_PAYMENT_URL = (
     else "https://test.payu.in/_payment"
 )
 
+
+# --------------------------------------------------------------------------
+# Storage — MongoDB (PyMongo's native async API)
+#
+# Collections (database name comes from MONGO_DB_NAME):
+#   users         {_id: user_id, first_name, username, joined_at, last_seen}
+#   premium       {_id: user_id, expiry: iso}
+#   verified      {_id: user_id, expiry: iso}      (token verification)
+#   referrals     {_id: referred_user_id, referrer_id, rewarded}
+#   transactions  {_id: txnid, user_id, chat_id, amount, plan_days, ...}
+#   settings      {_id: "main", ...all bot-wide settings...}
+#   meta          {_id: "...", ...internal markers, e.g. legacy import}
+# --------------------------------------------------------------------------
+
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "filestore_bot")
+
+# Old JSON file — only read once, to import existing data into MongoDB.
 DATA_FILE = pathlib.Path(__file__).parent / "data.json"
+
+# Serialises the few read-modify-write operations (extending premium,
+# toggling a shortener). Everything else is a single atomic Mongo op.
 DATA_LOCK = asyncio.Lock()
 
+_SETTINGS_ID = "main"
+_client: AsyncMongoClient | None = None
+
+
+def _db():
+    global _client
+    if _client is None:
+        if not MONGO_URI:
+            raise RuntimeError(
+                "MONGO_URI environment variable is not set. Add your MongoDB "
+                "connection string (e.g. mongodb+srv://user:pass@cluster/...)."
+            )
+        _client = AsyncMongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+    return _client[MONGO_DB_NAME]
+
+
+async def init_db() -> None:
+    """Call once at startup: checks the connection, creates indexes and
+    imports the legacy data.json (if one exists) into MongoDB."""
+    db = _db()
+    await db.command("ping")
+    await db.referrals.create_index("referrer_id")
+    await db.transactions.create_index("user_id")
+    await _import_legacy_json(db)
+    logger.info("MongoDB connected (db=%s)", MONGO_DB_NAME)
+
+
+async def close_db() -> None:
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
+
+
+async def _import_legacy_json(db) -> None:
+    """One-time import of the old data.json so existing premium users,
+    referrals, transactions and settings aren't lost when switching to
+    MongoDB. Runs at most once (tracked by a marker document)."""
+    marker_id = "legacy_json_import"
+    if await db.meta.find_one({"_id": marker_id}):
+        return
+    if not DATA_FILE.exists():
+        return
+    try:
+        legacy = json.loads(DATA_FILE.read_text())
+    except Exception:
+        logger.exception("Could not read legacy data.json — skipping import")
+        return
+
+    for uid, expiry in legacy.get("premium", {}).items():
+        await db.premium.replace_one({"_id": int(uid)}, {"expiry": expiry}, upsert=True)
+    for uid, expiry in legacy.get("verified", {}).items():
+        await db.verified.replace_one({"_id": int(uid)}, {"expiry": expiry}, upsert=True)
+    for uid, rec in legacy.get("referrals", {}).items():
+        await db.referrals.replace_one(
+            {"_id": int(uid)},
+            {"referrer_id": rec.get("referrer_id"), "rewarded": bool(rec.get("rewarded"))},
+            upsert=True,
+        )
+    for txnid, txn in legacy.get("transactions", {}).items():
+        await db.transactions.replace_one({"_id": txnid}, dict(txn), upsert=True)
+    if legacy.get("settings"):
+        await db.settings.replace_one({"_id": _SETTINGS_ID}, dict(legacy["settings"]), upsert=True)
+
+    await db.meta.insert_one({"_id": marker_id, "imported_at": _now_iso()})
+    logger.info("Imported legacy data.json into MongoDB")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # --------------------------------------------------------------------------
-# Storage (simple JSON file: {"premium": {user_id: expiry_iso},
-#                              "transactions": {txnid: {...}}})
-# NOTE: on most free hosting (e.g. Render's free tier) local disk is
-# ephemeral and can be wiped on redeploy/restart. For real production use,
-# swap this out for a proper database (Postgres, Redis, etc.).
+# Users
 # --------------------------------------------------------------------------
 
-def _load_data() -> dict:
-    if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text())
-        except Exception:
-            logger.exception("Failed to read data.json, starting fresh")
-    return {"premium": {}, "transactions": {}}
+async def register_user(user) -> bool:
+    """Upserts a Telegram user (call on /start). Returns True if this is
+    the first time we've seen them."""
+    now = _now_iso()
+    res = await _db().users.update_one(
+        {"_id": user.id},
+        {
+            "$set": {
+                "first_name": user.first_name,
+                "username": user.username,
+                "last_seen": now,
+            },
+            "$setOnInsert": {"joined_at": now},
+        },
+        upsert=True,
+    )
+    return res.upserted_id is not None
 
 
-def _save_data(data: dict) -> None:
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+async def count_users() -> int:
+    return await _db().users.count_documents({})
 
+
+async def get_all_user_ids() -> list[int]:
+    ids = []
+    async for doc in _db().users.find({}, {"_id": 1}):
+        ids.append(doc["_id"])
+    return ids
+
+
+# --------------------------------------------------------------------------
+# Transactions
+# --------------------------------------------------------------------------
 
 async def save_transaction(txnid: str, txn: dict) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        data.setdefault("transactions", {})[txnid] = txn
-        _save_data(data)
+    await _db().transactions.replace_one({"_id": txnid}, dict(txn), upsert=True)
 
 
 async def get_transaction(txnid: str) -> dict | None:
-    async with DATA_LOCK:
-        data = _load_data()
-        return data.get("transactions", {}).get(txnid)
+    doc = await _db().transactions.find_one({"_id": txnid})
+    if doc:
+        doc.pop("_id", None)
+    return doc
 
+
+async def claim_transaction_success(txnid: str) -> bool:
+    """Atomically flips a transaction to "success". Returns True only for
+    the single caller that made the flip — PayU sends both a webhook and
+    a browser redirect, so this stops premium being granted twice."""
+    res = await _db().transactions.update_one(
+        {"_id": txnid, "status": {"$ne": "success"}},
+        {"$set": {"status": "success"}},
+    )
+    return res.modified_count == 1
+
+
+async def unclaim_transaction(txnid: str) -> None:
+    """Rolls a claimed transaction back to "pending" (used if granting
+    premium fails right after claiming, so a retry can succeed)."""
+    await _db().transactions.update_one({"_id": txnid}, {"$set": {"status": "pending"}})
+
+
+# --------------------------------------------------------------------------
+# Premium
+# --------------------------------------------------------------------------
 
 async def set_premium(user_id: int, expiry_iso: str) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        data.setdefault("premium", {})[str(user_id)] = expiry_iso
-        _save_data(data)
+    await _db().premium.update_one(
+        {"_id": user_id}, {"$set": {"expiry": expiry_iso}}, upsert=True
+    )
 
 
 async def get_premium_expiry(user_id: int) -> str | None:
-    async with DATA_LOCK:
-        data = _load_data()
-        return data.get("premium", {}).get(str(user_id))
+    doc = await _db().premium.find_one({"_id": user_id})
+    return doc["expiry"] if doc else None
 
 
 async def is_premium(user_id: int) -> bool:
@@ -137,10 +268,9 @@ async def grant_premium_days(user_id: int, days: int) -> str:
     plan, or starting fresh from now if they have none/expired). Returns
     the new expiry ISO string."""
     async with DATA_LOCK:
-        data = _load_data()
         now = datetime.now(timezone.utc)
         base = now
-        existing = data.get("premium", {}).get(str(user_id))
+        existing = await get_premium_expiry(user_id)
         if existing:
             try:
                 exp_dt = datetime.fromisoformat(existing)
@@ -148,14 +278,32 @@ async def grant_premium_days(user_id: int, days: int) -> str:
                     base = exp_dt
             except Exception:
                 pass
-        new_expiry = base + timedelta(days=days)
-        data.setdefault("premium", {})[str(user_id)] = new_expiry.isoformat()
-        _save_data(data)
-        return new_expiry.isoformat()
+        new_expiry = (base + timedelta(days=days)).isoformat()
+        await set_premium(user_id, new_expiry)
+        return new_expiry
 
 
-def _get_settings(data: dict) -> dict:
-    settings = data.setdefault("settings", {})
+async def list_premium() -> dict:
+    """Returns {user_id_str: expiry_iso} for every user ever granted
+    premium (including expired ones)."""
+    out = {}
+    async for doc in _db().premium.find():
+        out[str(doc["_id"])] = doc["expiry"]
+    return out
+
+
+async def remove_premium(user_id: int) -> bool:
+    """Removes a user from the premium store. Returns True if they were
+    present, False if they weren't premium to begin with."""
+    res = await _db().premium.delete_one({"_id": user_id})
+    return res.deleted_count > 0
+
+
+# --------------------------------------------------------------------------
+# Settings (one document, _id "main")
+# --------------------------------------------------------------------------
+
+def _apply_defaults(settings: dict) -> dict:
     settings.setdefault("premium_enabled", True)
     pm = settings.setdefault("premium_message", {})
     pm.setdefault("text", None)
@@ -166,12 +314,10 @@ def _get_settings(data: dict) -> dict:
     settings.setdefault("free_limit_count", 5)
 
     # Link shorteners (admin-only). Multiple can be added; one is picked
-    # at random for every verification link, so if one service is down
-    # the others keep working.
+    # at random for every verification link.
     settings.setdefault("shorteners", [])
 
-    # Token verification — required for free (non-premium) users before
-    # they can open a file link. Disabled by default.
+    # Token verification — required for free (non-premium) users.
     tv = settings.setdefault("token_verification", {})
     tv.setdefault("enabled", False)
     tv.setdefault("validity_hours", 24)
@@ -181,113 +327,81 @@ def _get_settings(data: dict) -> dict:
     fs.setdefault("enabled", False)
     fs.setdefault("channels", [])
 
-    # Custom caption applied to every file post.
     cap = settings.setdefault("caption", {})
     cap.setdefault("enabled", False)
     cap.setdefault("template", None)
 
-    # Custom thumbnail applied to every file post.
     thumb = settings.setdefault("thumbnail", {})
     thumb.setdefault("enabled", False)
     thumb.setdefault("file_id", None)
 
-    # Custom inline button attached under every file post.
     btn = settings.setdefault("button", {})
     btn.setdefault("enabled", False)
     btn.setdefault("label", None)
     btn.setdefault("url", None)
 
-    # Auto delete: remove the sent file message after N seconds.
     ad = settings.setdefault("auto_delete", {})
     ad.setdefault("enabled", False)
     ad.setdefault("seconds", 600)
 
-    # Protect content: stop users from forwarding/saving sent files.
     pc = settings.setdefault("protect_content", {})
     pc.setdefault("enabled", False)
 
     return settings
 
 
+async def _settings() -> dict:
+    doc = await _db().settings.find_one({"_id": _SETTINGS_ID}) or {}
+    doc.pop("_id", None)
+    return _apply_defaults(doc)
+
+
+async def _set(**fields) -> None:
+    """$set one or more settings fields. Use dotted paths via the dict
+    form: _set(**{"caption.enabled": True})."""
+    if not fields:
+        return
+    await _db().settings.update_one(
+        {"_id": _SETTINGS_ID}, {"$set": fields}, upsert=True
+    )
+
+
 async def is_free_limit_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["free_limit_enabled"]
+    return (await _settings())["free_limit_enabled"]
 
 
 async def set_free_limit_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["free_limit_enabled"] = value
-        _save_data(data)
+    await _set(free_limit_enabled=value)
 
 
 async def get_free_limit_count() -> int:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["free_limit_count"]
+    return (await _settings())["free_limit_count"]
 
 
 async def set_free_limit_count(count: int) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["free_limit_count"] = count
-        _save_data(data)
+    await _set(free_limit_count=count)
 
 
 async def is_premium_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["premium_enabled"]
+    return (await _settings())["premium_enabled"]
 
 
 async def set_premium_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["premium_enabled"] = value
-        _save_data(data)
+    await _set(premium_enabled=value)
 
 
 async def get_premium_message() -> dict:
-    async with DATA_LOCK:
-        data = _load_data()
-        return dict(_get_settings(data)["premium_message"])
+    return dict((await _settings())["premium_message"])
 
 
 async def set_premium_message(**fields) -> None:
     """Updates one or more fields of the custom premium-plan message
     (text, photo_file_id, button_text, button_url)."""
-    async with DATA_LOCK:
-        data = _load_data()
-        pm = _get_settings(data)["premium_message"]
-        pm.update(fields)
-        _save_data(data)
-
-
-async def list_premium() -> dict:
-    """Returns {user_id_str: expiry_iso} for every user ever granted
-    premium (including expired ones)."""
-    async with DATA_LOCK:
-        data = _load_data()
-        return dict(data.get("premium", {}))
-
-
-async def remove_premium(user_id: int) -> bool:
-    """Removes a user from the premium store. Returns True if they were
-    present, False if they weren't premium to begin with."""
-    async with DATA_LOCK:
-        data = _load_data()
-        key = str(user_id)
-        if key in data.get("premium", {}):
-            del data["premium"][key]
-            _save_data(data)
-            return True
-        return False
+    await _set(**{f"premium_message.{k}": v for k, v in fields.items()})
 
 
 # --------------------------------------------------------------------------
 # Refer & Earn
-# data["referrals"] = {referred_user_id_str: {"referrer_id": int, "rewarded": bool}}
 # --------------------------------------------------------------------------
 
 async def record_referral(referred_id: int, referrer_id: int) -> bool:
@@ -296,60 +410,45 @@ async def record_referral(referred_id: int, referrer_id: int) -> bool:
     referrer on file (or referred == referrer)."""
     if referred_id == referrer_id:
         return False
-    async with DATA_LOCK:
-        data = _load_data()
-        referrals = data.setdefault("referrals", {})
-        key = str(referred_id)
-        if key in referrals:
-            return False
-        referrals[key] = {"referrer_id": referrer_id, "rewarded": False}
-        _save_data(data)
+    try:
+        await _db().referrals.insert_one(
+            {"_id": referred_id, "referrer_id": referrer_id, "rewarded": False}
+        )
         return True
+    except DuplicateKeyError:
+        return False
 
 
 async def get_referral(referred_id: int) -> dict | None:
-    async with DATA_LOCK:
-        data = _load_data()
-        return data.get("referrals", {}).get(str(referred_id))
+    doc = await _db().referrals.find_one({"_id": referred_id})
+    if not doc:
+        return None
+    return {"referrer_id": doc.get("referrer_id"), "rewarded": bool(doc.get("rewarded"))}
 
 
 async def mark_referral_rewarded(referred_id: int) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        rec = data.get("referrals", {}).get(str(referred_id))
-        if rec:
-            rec["rewarded"] = True
-            _save_data(data)
+    await _db().referrals.update_one({"_id": referred_id}, {"$set": {"rewarded": True}})
 
 
 async def get_referral_stats(referrer_id: int) -> dict:
     """Returns {"total": n, "rewarded": n} for everyone a user has
     referred so far."""
-    async with DATA_LOCK:
-        data = _load_data()
-        referrals = data.get("referrals", {})
-        total = 0
-        rewarded = 0
-        for rec in referrals.values():
-            if rec.get("referrer_id") == referrer_id:
-                total += 1
-                if rec.get("rewarded"):
-                    rewarded += 1
-        return {"total": total, "rewarded": rewarded}
+    referrals = _db().referrals
+    total = await referrals.count_documents({"referrer_id": referrer_id})
+    rewarded = await referrals.count_documents({"referrer_id": referrer_id, "rewarded": True})
+    return {"total": total, "rewarded": rewarded}
 
 
 # --------------------------------------------------------------------------
 # Link shorteners (admin-only, multiple)
-# data["settings"]["shorteners"] = [
+# settings["shorteners"] = [
 #     {"id": "a1b2c3d4", "name": "GPLinks", "api_domain": "api.gplinks.com",
 #      "api_key": "...", "enabled": True}, ...
 # ]
 # --------------------------------------------------------------------------
 
 async def list_shorteners() -> list[dict]:
-    async with DATA_LOCK:
-        data = _load_data()
-        return list(_get_settings(data)["shorteners"])
+    return list((await _settings())["shorteners"])
 
 
 async def add_shortener(name: str, api_domain: str, api_key: str) -> dict:
@@ -360,35 +459,31 @@ async def add_shortener(name: str, api_domain: str, api_key: str) -> dict:
         "api_key": api_key.strip(),
         "enabled": True,
     }
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["shorteners"].append(entry)
-        _save_data(data)
+    await _db().settings.update_one(
+        {"_id": _SETTINGS_ID}, {"$push": {"shorteners": entry}}, upsert=True
+    )
     return entry
 
 
 async def remove_shortener(shortener_id: str) -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        shorteners = _get_settings(data)["shorteners"]
-        new_list = [s for s in shorteners if s["id"] != shortener_id]
-        if len(new_list) == len(shorteners):
-            return False
-        _get_settings(data)["shorteners"] = new_list
-        _save_data(data)
-        return True
+    res = await _db().settings.update_one(
+        {"_id": _SETTINGS_ID}, {"$pull": {"shorteners": {"id": shortener_id}}}
+    )
+    return res.modified_count == 1
 
 
 async def toggle_shortener(shortener_id: str) -> bool | None:
     """Flips a shortener's enabled flag. Returns the new state, or None
     if no shortener with that id exists."""
     async with DATA_LOCK:
-        data = _load_data()
-        for s in _get_settings(data)["shorteners"]:
+        for s in await list_shorteners():
             if s["id"] == shortener_id:
-                s["enabled"] = not s["enabled"]
-                _save_data(data)
-                return s["enabled"]
+                new_state = not s["enabled"]
+                await _db().settings.update_one(
+                    {"_id": _SETTINGS_ID, "shorteners.id": shortener_id},
+                    {"$set": {"shorteners.$.enabled": new_state}},
+                )
+                return new_state
         return None
 
 
@@ -421,54 +516,40 @@ async def shorten_url(long_url: str) -> str:
 
 # --------------------------------------------------------------------------
 # Token verification (free users only)
-# data["verified"] = {user_id_str: expiry_iso}
 # --------------------------------------------------------------------------
 
 async def is_token_verification_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["token_verification"]["enabled"]
+    return (await _settings())["token_verification"]["enabled"]
 
 
 async def set_token_verification_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["token_verification"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"token_verification.enabled": value})
 
 
 async def get_verification_validity_hours() -> int:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["token_verification"]["validity_hours"]
+    return (await _settings())["token_verification"]["validity_hours"]
 
 
 async def set_verification_validity_hours(hours: int) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["token_verification"]["validity_hours"] = hours
-        _save_data(data)
+    await _set(**{"token_verification.validity_hours": hours})
 
 
 async def is_verified(user_id: int) -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        expiry = data.get("verified", {}).get(str(user_id))
-    if not expiry:
+    doc = await _db().verified.find_one({"_id": user_id})
+    if not doc:
         return False
     try:
-        return datetime.fromisoformat(expiry) > datetime.now(timezone.utc)
+        return datetime.fromisoformat(doc["expiry"]) > datetime.now(timezone.utc)
     except Exception:
         return False
 
 
 async def set_verified(user_id: int, hours: int) -> str:
-    expiry = datetime.now(timezone.utc) + timedelta(hours=hours)
-    async with DATA_LOCK:
-        data = _load_data()
-        data.setdefault("verified", {})[str(user_id)] = expiry.isoformat()
-        _save_data(data)
-    return expiry.isoformat()
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    await _db().verified.update_one(
+        {"_id": user_id}, {"$set": {"expiry": expiry}}, upsert=True
+    )
+    return expiry
 
 
 # --------------------------------------------------------------------------
@@ -476,22 +557,15 @@ async def set_verified(user_id: int, hours: int) -> str:
 # --------------------------------------------------------------------------
 
 async def is_force_sub_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["force_subscribe"]["enabled"]
+    return (await _settings())["force_subscribe"]["enabled"]
 
 
 async def set_force_sub_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["force_subscribe"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"force_subscribe.enabled": value})
 
 
 async def list_force_sub_channels() -> list[dict]:
-    async with DATA_LOCK:
-        data = _load_data()
-        return list(_get_settings(data)["force_subscribe"]["channels"])
+    return list((await _settings())["force_subscribe"]["channels"])
 
 
 async def add_force_sub_channel(chat_id: int, title: str, invite_link: str,
@@ -503,23 +577,18 @@ async def add_force_sub_channel(chat_id: int, title: str, invite_link: str,
         "username": username,
         "invite_link": invite_link,
     }
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["force_subscribe"]["channels"].append(entry)
-        _save_data(data)
+    await _db().settings.update_one(
+        {"_id": _SETTINGS_ID}, {"$push": {"force_subscribe.channels": entry}}, upsert=True
+    )
     return entry
 
 
 async def remove_force_sub_channel(entry_id: str) -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        channels = _get_settings(data)["force_subscribe"]["channels"]
-        new_list = [c for c in channels if c["entry_id"] != entry_id]
-        if len(new_list) == len(channels):
-            return False
-        _get_settings(data)["force_subscribe"]["channels"] = new_list
-        _save_data(data)
-        return True
+    res = await _db().settings.update_one(
+        {"_id": _SETTINGS_ID},
+        {"$pull": {"force_subscribe.channels": {"entry_id": entry_id}}},
+    )
+    return res.modified_count == 1
 
 
 async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
@@ -546,122 +615,75 @@ async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
 # --------------------------------------------------------------------------
 
 async def is_caption_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["caption"]["enabled"]
+    return (await _settings())["caption"]["enabled"]
 
 
 async def set_caption_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["caption"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"caption.enabled": value})
 
 
 async def get_caption_template() -> str | None:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["caption"]["template"]
+    return (await _settings())["caption"]["template"]
 
 
 async def set_caption_template(template: str) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["caption"]["template"] = template
-        _save_data(data)
+    await _set(**{"caption.template": template})
 
 
 async def is_thumbnail_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["thumbnail"]["enabled"]
+    return (await _settings())["thumbnail"]["enabled"]
 
 
 async def set_thumbnail_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["thumbnail"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"thumbnail.enabled": value})
 
 
 async def get_thumbnail_file_id() -> str | None:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["thumbnail"]["file_id"]
+    return (await _settings())["thumbnail"]["file_id"]
 
 
 async def set_thumbnail_file_id(file_id: str | None) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["thumbnail"]["file_id"] = file_id
-        _save_data(data)
+    await _set(**{"thumbnail.file_id": file_id})
 
 
 async def is_custom_button_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["button"]["enabled"]
+    return (await _settings())["button"]["enabled"]
 
 
 async def set_custom_button_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["button"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"button.enabled": value})
 
 
 async def get_custom_button() -> dict:
-    async with DATA_LOCK:
-        data = _load_data()
-        return dict(_get_settings(data)["button"])
+    return dict((await _settings())["button"])
 
 
 async def set_custom_button(label: str, url: str) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        btn = _get_settings(data)["button"]
-        btn["label"] = label
-        btn["url"] = url
-        _save_data(data)
+    await _set(**{"button.label": label, "button.url": url})
 
 
 async def is_auto_delete_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["auto_delete"]["enabled"]
+    return (await _settings())["auto_delete"]["enabled"]
 
 
 async def set_auto_delete_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["auto_delete"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"auto_delete.enabled": value})
 
 
 async def get_auto_delete_seconds() -> int:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["auto_delete"]["seconds"]
+    return (await _settings())["auto_delete"]["seconds"]
 
 
 async def set_auto_delete_seconds(seconds: int) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["auto_delete"]["seconds"] = seconds
-        _save_data(data)
+    await _set(**{"auto_delete.seconds": seconds})
 
 
 async def is_protect_content_enabled() -> bool:
-    async with DATA_LOCK:
-        data = _load_data()
-        return _get_settings(data)["protect_content"]["enabled"]
+    return (await _settings())["protect_content"]["enabled"]
 
 
 async def set_protect_content_enabled(value: bool) -> None:
-    async with DATA_LOCK:
-        data = _load_data()
-        _get_settings(data)["protect_content"]["enabled"] = value
-        _save_data(data)
+    await _set(**{"protect_content.enabled": value})
 
 
 # --------------------------------------------------------------------------
@@ -725,10 +747,16 @@ async def process_payu_response(params: dict, bot) -> tuple[bool, str]:
     if status == "success":
         # Extend on top of any remaining active premium instead of
         # overwriting it, so buying/extending never shortens a plan.
-        new_expiry_iso = await grant_premium_days(txn["user_id"], txn["plan_days"])
+        # PayU fires both a webhook and a browser redirect; only the caller
+        # that atomically claims the transaction may grant premium.
+        if not await claim_transaction_success(txnid):
+            return True, "already processed"
+        try:
+            new_expiry_iso = await grant_premium_days(txn["user_id"], txn["plan_days"])
+        except Exception:
+            await unclaim_transaction(txnid)
+            raise
         expiry = datetime.fromisoformat(new_expiry_iso)
-        txn["status"] = "success"
-        await save_transaction(txnid, txn)
         try:
             await bot.send_message(
                 chat_id=txn["chat_id"],
