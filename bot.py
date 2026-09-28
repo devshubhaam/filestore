@@ -342,6 +342,11 @@ def build_verification_deep_link(bot_username: str, user_id: int) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
+    try:
+        await payments.register_user(user)
+    except Exception:
+        logger.exception("Could not save user %s to MongoDB", user.id)
+
     if context.args:
         payload = context.args[0]
 
@@ -1775,6 +1780,9 @@ async def main() -> None:
             "Set your bot token first: export BOT_TOKEN='123456:ABC-DEF...'"
         )
 
+    # MongoDB must be reachable before anything else starts.
+    await payments.init_db()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -1812,6 +1820,7 @@ async def main() -> None:
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
+        await payments.close_db()
 
 
 if __name__ == "__main__":
