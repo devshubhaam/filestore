@@ -107,6 +107,7 @@ def build_help_text() -> str:
 
     buy_plan = section("💰", "Buy", [
         ("buy", "Buy the premium plan."),
+        ("credits", "View and earn credits."),
     ])
 
     file_storage = section("📦", "File storage commands", [
@@ -174,6 +175,7 @@ def build_settings_text() -> str:
 def build_settings_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("💎 Premium plan", callback_data="settings_premium")],
+        [InlineKeyboardButton("🪙 Credits", callback_data="credits_menu")],
         [InlineKeyboardButton("🆓 Free usage limit", callback_data="settings_free_limit")],
         [InlineKeyboardButton("🌍 Refer and earn", callback_data="settings_refer")],
     ]
@@ -298,6 +300,156 @@ def build_free_limit_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+# ============================================================
+# Credits
+# ============================================================
+
+def build_credits_text(balance: int, cost_per_file: int, daily_enabled: bool,
+                        daily_amount: int) -> str:
+    header = "🪙 <u>" + to_bold_unicode("Credits:") + "</u>"
+    desc = (
+        "<blockquote>"
+        + to_bold_unicode(
+            f"1 file access = {cost_per_file} credit(s). Premium users "
+            "never spend credits."
+        )
+        + "</blockquote>"
+    )
+    balance_line = "💰 " + to_bold_unicode(f"Your balance: {balance} credits")
+    daily_line = (
+        "🎁 " + to_bold_unicode(f"Daily login: +{daily_amount} credit(s)")
+        if daily_enabled else
+        "🎁 " + to_bold_unicode("Daily login: currently off")
+    )
+    return "\n\n".join([header, desc, balance_line, daily_line])
+
+
+def build_credits_keyboard(daily_enabled: bool, is_admin_user: bool = False) -> InlineKeyboardMarkup:
+    keyboard = []
+    if daily_enabled:
+        keyboard.append([InlineKeyboardButton("🎁 Claim daily credit", callback_data="credits_daily")])
+    keyboard += [
+        [InlineKeyboardButton("🔗 Earn via shortener", callback_data="credits_earn")],
+        [InlineKeyboardButton("🌍 Refer and earn", callback_data="settings_refer")],
+        [InlineKeyboardButton("💳 Buy credits", callback_data="credits_buy")],
+    ]
+    if is_admin_user:
+        keyboard.append([InlineKeyboardButton("⚙️ Admin: credit settings", callback_data="credits_admin")])
+    keyboard.append([InlineKeyboardButton("◀ Back", callback_data="settings")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_credits_earn_text(shorteners: list[dict]) -> str:
+    header = "🔗 <u>" + to_bold_unicode("Earn credits:") + "</u>"
+    if not shorteners:
+        body = "<blockquote>" + to_bold_unicode("Abhi koi shortener available nahi hai.") + "</blockquote>"
+    else:
+        body = "<blockquote>" + to_bold_unicode(
+            "Neeche diye gaye kisi bhi link ko complete karo — har link "
+            "sirf ek baar credit deta hai."
+        ) + "</blockquote>"
+    return f"{header}\n\n{body}"
+
+
+def build_credits_earn_keyboard(shorteners: list[dict]) -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(
+            f"🎯 {s['name']} — +{s.get('reward_credits', 5)} credits",
+            callback_data=f"credits_earn_{s['id']}",
+        )]
+        for s in shorteners if s.get("enabled")
+    ]
+    keyboard.append([InlineKeyboardButton("◀ Back", callback_data="credits_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_credits_buy_text() -> str:
+    header = "💳 <u>" + to_bold_unicode("Buy credits:") + "</u>"
+    body = "<blockquote>" + to_bold_unicode(
+        "Bigger packs cost less per credit."
+    ) + "</blockquote>"
+    return f"{header}\n\n{body}"
+
+
+def build_credits_buy_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(
+            f"🪙 {p['credits']} credits - ₹{p['amount']}", callback_data=f"creditpack_{p['id']}"
+        )]
+        for p in payments.CREDIT_PACKS
+    ]
+    keyboard.append([InlineKeyboardButton("◀ Back", callback_data="credits_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_credits_admin_text(cost_per_file: int, daily_enabled: bool, daily_amount: int,
+                              referral_reward: int) -> str:
+    header = "⚙️ <u>" + to_bold_unicode("Credit settings (admin):") + "</u>"
+    lines = [
+        to_bold_unicode(f"Cost per file: {cost_per_file} credit(s)"),
+        to_bold_unicode(f"Daily login: {'ON ✅' if daily_enabled else 'OFF ❌'} — {daily_amount} credit(s)"),
+        to_bold_unicode(f"Referral reward: {referral_reward} credit(s)"),
+    ]
+    return header + "\n\n" + "\n".join(lines)
+
+
+def build_credits_admin_keyboard(daily_enabled: bool) -> InlineKeyboardMarkup:
+    toggle_label = "🔒 Daily credit is on - ✅" if daily_enabled else "🔓 Daily credit is off - ❌"
+    keyboard = [
+        [InlineKeyboardButton("✏️ Set cost per file", callback_data="credits_set_cost")],
+        [InlineKeyboardButton(toggle_label, callback_data="credits_daily_toggle")],
+        [InlineKeyboardButton("✏️ Set daily amount", callback_data="credits_set_daily_amount")],
+        [InlineKeyboardButton("✏️ Set referral reward", callback_data="credits_set_referral_reward")],
+        [InlineKeyboardButton("◀ Back", callback_data="credits_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def build_credit_buy_offer(user, chat_id, pack_id: str):
+    """Creates a pending PayU transaction for a credit pack. Returns
+    (text, keyboard), None if PayU isn't configured, or "invalid_pack"."""
+    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+        return None
+    pack = payments.get_credit_pack(pack_id)
+    if pack is None:
+        return "invalid_pack"
+
+    txnid = uuid.uuid4().hex[:20]
+    txn = {
+        "user_id": user.id,
+        "chat_id": chat_id,
+        "kind": "credits",
+        "amount": pack["amount"],
+        "credits": pack["credits"],
+        "plan_label": f"{pack['credits']} Credits",
+        "firstname": user.first_name or "User",
+        "email": f"user{user.id}@telegram.local",
+        "phone": "9999999999",
+        "status": "pending",
+    }
+    await payments.save_transaction(txnid, txn)
+
+    pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"💳 Pay ₹{pack['amount']} now", url=pay_url)],
+            [InlineKeyboardButton("◀ Back", callback_data="credits_buy")],
+        ]
+    )
+    text = (
+        "🪙 " + to_bold_unicode(f"{pack['credits']} Credits - ₹{pack['amount']}")
+        + "\n\n"
+        + "<blockquote>"
+        + "💳 " + to_bold_unicode(
+            "Pay via UPI, UPI QR, cards, netbanking or wallet — all shown "
+            "on the payment page."
+        )
+        + "</blockquote>\n\n"
+        + to_bold_unicode("Tap the button below to pay.")
+    )
+    return text, keyboard
+
+
 def build_start_text(user_first_name: str) -> str:
     # Text itself is already bold via Unicode Mathematical Sans-Serif Bold
     # characters, so only <blockquote> (structural, not styling) needs HTML.
@@ -331,11 +483,7 @@ def build_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_verification_deep_link(bot_username: str, user_id: int) -> str:
-    """A one-time-looking deep link tied to `user_id`. Whoever clicks
-    it after completing the shortener steps is verified for
-    `token_verification.validity_hours`."""
-    token = f"{user_id}-{uuid.uuid4().hex[:6]}"
+def build_verification_deep_link(bot_username: str, token: str) -> str:
     return f"https://t.me/{bot_username}?start=verify_{token}"
 
 
@@ -358,27 +506,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         elif payload.startswith("verify_"):
             token = payload[len("verify_"):]
-            owner_id_str = token.split("-", 1)[0]
-            if not owner_id_str.isdigit() or int(owner_id_str) != user.id:
+            doc = await payments.consume_verify_token(token, user.id)
+            if doc is None:
                 await update.message.reply_text(
                     "⚠️ " + to_bold_unicode(
-                        "Yeh verification link aapke liye nahi hai. Apna "
-                        "khud ka link use karein."
+                        "Yeh link invalid hai, expire ho gaya hai, ya pehle "
+                        "hi use ho chuka hai."
                     )
                 )
                 return
-            hours = await payments.get_verification_validity_hours()
-            await payments.set_verified(user.id, hours)
-            await update.message.reply_text(
-                "✅ " + to_bold_unicode(
-                    f"Verified! Ab agle {hours} ghante tak aap files "
-                    "access kar sakte hain."
+
+            if doc["purpose"] == "credit":
+                new_balance = await payments.add_credits(user.id, doc["reward_credits"])
+                await payments.maybe_reward_referral_credits(user.id)
+                await update.message.reply_text(
+                    "✅ " + to_bold_unicode(
+                        f"+{doc['reward_credits']} credits mile! Naya balance: {new_balance}."
+                    ),
                 )
-                + "\n\n" + to_bold_unicode(
-                    "Jo file link khola tha, wapas wahi link se try karein."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
+            else:  # "gate" — free-user file-access verification
+                hours = await payments.get_verification_validity_hours()
+                await payments.set_verified(user.id, hours)
+                await update.message.reply_text(
+                    "✅ " + to_bold_unicode(
+                        f"Verified! Ab agle {hours} ghante tak aap files "
+                        "access kar sakte hain."
+                    )
+                    + "\n\n" + to_bold_unicode(
+                        "Jo file link khola tha, wapas wahi link se try karein."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             return
 
     await update.message.reply_text(
@@ -418,6 +576,12 @@ def build_shortener_menu_keyboard(shorteners: list[dict]) -> InlineKeyboardMarku
         keyboard.append([
             InlineKeyboardButton(f"{toggle} {s['name']}", callback_data=f"short_toggle_{s['id']}"),
             InlineKeyboardButton("🗑 Remove", callback_data=f"short_del_{s['id']}"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🪙 Reward: {s.get('reward_credits', 5)} credits — tap to edit",
+                callback_data=f"short_reward_{s['id']}",
+            )
         ])
     keyboard.append([InlineKeyboardButton("➕ Add Shortener", callback_data="short_add")])
     keyboard.append([InlineKeyboardButton("◀ Back", callback_data="settings")])
@@ -660,9 +824,20 @@ def build_protect_content_menu_keyboard(enabled: bool, admin_view: bool) -> Inli
 #           and await payments.is_token_verification_enabled() \
 #           and not await payments.is_verified(user.id):
 #                me = await context.bot.get_me()
-#                long_link = build_verification_deep_link(me.username, user.id)
+#                token = await payments.create_verify_token(user.id, purpose="gate")
+#                long_link = build_verification_deep_link(me.username, token)
 #                short_link = await payments.shorten_url(long_link)
 #                await message.reply_text(f"Verify here: {short_link}")
+#                return
+#
+#   2b. Credit gate (skip for premium users — everyone else spends
+#       credits per file; send them to the Credits menu if they're short):
+#        if not await payments.is_premium(user.id):
+#            cost = await payments.get_credit_cost_per_file()
+#            if not await payments.deduct_credit(user.id, cost):
+#                await message.reply_text(
+#                    "🪙 Not enough credits. Earn more from the Credits menu."
+#                )
 #                return
 #
 #   3. Caption / thumbnail / button / protect content when sending:
@@ -748,8 +923,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer()
         context.user_data["awaiting"] = "shortener_add"
         await query.edit_message_text(
-            text="➕ " + to_bold_unicode("Send: Name | api-domain.com | API_KEY")
-            + "\n<code>GPLinks | api.gplinks.com | abcd1234</code>"
+            text="➕ " + to_bold_unicode("Send: Name | api-domain.com | API_KEY | reward(optional)")
+            + "\n<code>GPLinks | api.gplinks.com | abcd1234 | 5</code>"
             + "\n\n" + to_bold_unicode("Send /cancel to cancel."),
             parse_mode=ParseMode.HTML,
         )
@@ -1309,6 +1484,188 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     # --------------------------------------------------------------------
 
+    # ---------------- Credits ----------------
+    if data == "credits_menu":
+        await query.answer()
+        balance = await payments.get_credits(user.id)
+        cost = await payments.get_credit_cost_per_file()
+        daily_on = await payments.is_daily_credit_enabled()
+        daily_amt = await payments.get_daily_credit_amount()
+        await query.edit_message_text(
+            text=build_credits_text(balance, cost, daily_on, daily_amt),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_keyboard(daily_on, is_admin(user.id)),
+        )
+        return
+
+    if data == "credits_daily":
+        ok, result = await payments.claim_daily_credit(user.id)
+        if ok:
+            await query.answer(f"✅ +1 credit! Naya balance: {result}", show_alert=True)
+        else:
+            hours = int(result.total_seconds() // 3600)
+            minutes = int((result.total_seconds() % 3600) // 60)
+            await query.answer(
+                f"⏳ Agla daily credit {hours}h {minutes}m baad milega.", show_alert=True
+            )
+        balance = await payments.get_credits(user.id)
+        cost = await payments.get_credit_cost_per_file()
+        daily_on = await payments.is_daily_credit_enabled()
+        daily_amt = await payments.get_daily_credit_amount()
+        await query.edit_message_text(
+            text=build_credits_text(balance, cost, daily_on, daily_amt),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_keyboard(daily_on, is_admin(user.id)),
+        )
+        return
+
+    if data == "credits_earn":
+        await query.answer()
+        shorteners = await payments.list_shorteners()
+        await query.edit_message_text(
+            text=build_credits_earn_text(shorteners),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_earn_keyboard(shorteners),
+        )
+        return
+
+    if data.startswith("credits_earn_"):
+        shortener_id = data[len("credits_earn_"):]
+        shorteners = {s["id"]: s for s in await payments.list_shorteners()}
+        shortener = shorteners.get(shortener_id)
+        if not shortener or not shortener.get("enabled"):
+            await query.answer("⚠️ Yeh shortener ab available nahi hai.", show_alert=True)
+            return
+        await query.answer()
+        me = await context.bot.get_me()
+        reward = shortener.get("reward_credits", 5)
+        token = await payments.create_verify_token(
+            user.id, purpose="credit", shortener_id=shortener_id, reward_credits=reward
+        )
+        long_link = build_verification_deep_link(me.username, token)
+        short_link = await payments.shorten_url(long_link, shortener_id=shortener_id)
+        await query.edit_message_text(
+            text="🔗 " + to_bold_unicode(f"Complete this to earn +{reward} credits:")
+            + f"\n{short_link}\n\n"
+            + to_bold_unicode("Steps complete karne ke baad aap wapas bot par aa jaayenge "
+                               "aur credits mil jaayenge."),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Back", callback_data="credits_earn")]]
+            ),
+        )
+        return
+
+    if data == "credits_buy":
+        await query.answer()
+        await query.edit_message_text(
+            text=build_credits_buy_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_buy_keyboard(),
+        )
+        return
+
+    if data.startswith("creditpack_"):
+        pack_id = data[len("creditpack_"):]
+        offer = await build_credit_buy_offer(user, update.effective_chat.id, pack_id)
+        if offer is None:
+            await query.answer()
+            await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
+            return
+        if offer == "invalid_pack":
+            await query.answer("⚠️ Invalid pack.", show_alert=True)
+            return
+        await query.answer()
+        text, keyboard = offer
+        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    if data == "credits_admin":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        cost = await payments.get_credit_cost_per_file()
+        daily_on = await payments.is_daily_credit_enabled()
+        daily_amt = await payments.get_daily_credit_amount()
+        referral_reward = await payments.get_referral_reward_credits()
+        await query.edit_message_text(
+            text=build_credits_admin_text(cost, daily_on, daily_amt, referral_reward),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_admin_keyboard(daily_on),
+        )
+        return
+
+    if data == "credits_set_cost":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = "credits_cost_per_file"
+        await query.edit_message_text(
+            text="✏️ " + to_bold_unicode("Send credit cost per file, e.g.")
+            + "\n<code>1</code>\n\n" + to_bold_unicode("Send /cancel to cancel."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "credits_daily_toggle":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        currently_on = await payments.is_daily_credit_enabled()
+        await payments.set_daily_credit_enabled(not currently_on)
+        await query.answer("Daily credit turned " + ("OFF ❌" if currently_on else "ON ✅"))
+        cost = await payments.get_credit_cost_per_file()
+        daily_amt = await payments.get_daily_credit_amount()
+        referral_reward = await payments.get_referral_reward_credits()
+        await query.edit_message_text(
+            text=build_credits_admin_text(cost, not currently_on, daily_amt, referral_reward),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_credits_admin_keyboard(not currently_on),
+        )
+        return
+
+    if data == "credits_set_daily_amount":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = "credits_daily_amount"
+        await query.edit_message_text(
+            text="✏️ " + to_bold_unicode("Send daily credit amount, e.g.")
+            + "\n<code>1</code>\n\n" + to_bold_unicode("Send /cancel to cancel."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "credits_set_referral_reward":
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = "credits_referral_reward"
+        await query.edit_message_text(
+            text="✏️ " + to_bold_unicode("Send referral reward in credits, e.g.")
+            + "\n<code>5</code>\n\n" + to_bold_unicode("Send /cancel to cancel."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("short_reward_"):
+        if not is_admin(user.id):
+            await query.answer("🚫 Admins only.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = f"shortener_reward:{data[len('short_reward_'):]}"
+        await query.edit_message_text(
+            text="✏️ " + to_bold_unicode("Send new reward credits for this shortener, e.g.")
+            + "\n<code>5</code>\n\n" + to_bold_unicode("Send /cancel to cancel."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    # --------------------------------------------------------------------
+
     await query.answer()
 
     if data == "help":
@@ -1550,6 +1907,19 @@ async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text)
 
 
+async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    balance = await payments.get_credits(user.id)
+    cost = await payments.get_credit_cost_per_file()
+    daily_on = await payments.is_daily_credit_enabled()
+    daily_amt = await payments.get_daily_credit_amount()
+    await update.message.reply_text(
+        text=build_credits_text(balance, cost, daily_on, daily_amt),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_credits_keyboard(daily_on, is_admin(user.id)),
+    )
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.pop("awaiting", None) is not None:
         await update.message.reply_text("Process Cancelled by User ❌")
@@ -1648,15 +2018,25 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
     if awaiting == "shortener_add":
         raw = update.message.text or ""
         parts = [p.strip() for p in raw.split("|")]
-        if len(parts) != 3 or not all(parts):
+        if len(parts) not in (3, 4) or not all(parts[:3]):
             await update.message.reply_text(
-                "⚠️ Format: Name | api-domain.com | API_KEY  (or /cancel)"
+                "⚠️ Format: Name | api-domain.com | API_KEY | reward_credits(optional)  (or /cancel)"
             )
             return
-        name, domain, api_key = parts
-        await payments.add_shortener(name, domain, api_key)
+        name, domain, api_key = parts[:3]
+        reward = 5
+        if len(parts) == 4:
+            if not parts[3].isdigit():
+                await update.message.reply_text(
+                    "⚠️ Reward credits must be a whole number (or /cancel)."
+                )
+                return
+            reward = int(parts[3])
+        await payments.add_shortener(name, domain, api_key, reward_credits=reward)
         context.user_data.pop("awaiting", None)
-        await update.message.reply_text("✅ " + to_bold_unicode(f"Shortener '{name}' added."))
+        await update.message.reply_text(
+            "✅ " + to_bold_unicode(f"Shortener '{name}' added ({reward} credits reward).")
+        )
         return
 
     if awaiting == "verification_hours":
@@ -1750,6 +2130,70 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
+    if awaiting == "credits_cost_per_file":
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            await update.message.reply_text(
+                "⚠️ Invalid number. Send a whole number like 1 (or /cancel)."
+            )
+            return
+        cost = int(raw)
+        await payments.set_credit_cost_per_file(cost)
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            "✅ " + to_bold_unicode(f"Credit cost per file set to {cost}.")
+        )
+        return
+
+    if awaiting == "credits_daily_amount":
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            await update.message.reply_text(
+                "⚠️ Invalid number. Send a whole number like 1 (or /cancel)."
+            )
+            return
+        amount = int(raw)
+        await payments.set_daily_credit_amount(amount)
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            "✅ " + to_bold_unicode(f"Daily credit amount set to {amount}.")
+        )
+        return
+
+    if awaiting == "credits_referral_reward":
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            await update.message.reply_text(
+                "⚠️ Invalid number. Send a whole number like 5 (or /cancel)."
+            )
+            return
+        amount = int(raw)
+        await payments.set_referral_reward_credits(amount)
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            "✅ " + to_bold_unicode(f"Referral reward set to {amount} credits.")
+        )
+        return
+
+    if awaiting and awaiting.startswith("shortener_reward:"):
+        shortener_id = awaiting.split(":", 1)[1]
+        raw = (update.message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            await update.message.reply_text(
+                "⚠️ Invalid number. Send a whole number like 5 (or /cancel)."
+            )
+            return
+        reward = int(raw)
+        ok = await payments.set_shortener_reward(shortener_id, reward)
+        context.user_data.pop("awaiting", None)
+        if ok:
+            await update.message.reply_text(
+                "✅ " + to_bold_unicode(f"Reward updated to {reward} credits.")
+            )
+        else:
+            await update.message.reply_text("⚠️ Shortener not found (was it removed?).")
+        return
+
 
 async def admin_photo_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Captures the next photo after an admin taps Premium Plan Picture or
@@ -1789,6 +2233,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("buy", buy))
     application.add_handler(CommandHandler("id", id_cmd))
     application.add_handler(CommandHandler("myplan", myplan))
+    application.add_handler(CommandHandler("credits", credits_cmd))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.PHOTO, admin_photo_reply_handler))
