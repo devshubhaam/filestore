@@ -101,6 +101,24 @@ def get_plan(plan_id: str) -> dict | None:
     return None
 
 
+# Credit packs for UPI purchase — bigger packs cost less per credit
+# (bulk discount). Edit freely; `id` is used in callback_data, keep it
+# short and stable.
+CREDIT_PACKS = [
+    {"id": "c10", "credits": 10, "amount": "10"},
+    {"id": "c30", "credits": 30, "amount": "27"},
+    {"id": "c60", "credits": 60, "amount": "48"},
+    {"id": "c100", "credits": 100, "amount": "70"},
+]
+
+
+def get_credit_pack(pack_id: str) -> dict | None:
+    for p in CREDIT_PACKS:
+        if p["id"] == pack_id:
+            return p
+    return None
+
+
 PAYU_PAYMENT_URL = (
     "https://secure.payu.in/_payment"
     if PAYU_MODE == "live"
@@ -154,6 +172,7 @@ async def init_db() -> None:
     await db.command("ping")
     await db.referrals.create_index("referrer_id")
     await db.transactions.create_index("user_id")
+    await db.verify_tokens.create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
     await _import_legacy_json(db)
     logger.info("MongoDB connected (db=%s)", MONGO_DB_NAME)
 
@@ -378,6 +397,14 @@ def _apply_defaults(settings: dict) -> dict:
     pc = settings.setdefault("protect_content", {})
     pc.setdefault("enabled", False)
 
+    # --- Credit system ---
+    dc = settings.setdefault("daily_credit", {})
+    dc.setdefault("enabled", True)
+    dc.setdefault("amount", 1)
+
+    settings.setdefault("referral_reward_credits", 5)
+    settings.setdefault("credit_cost_per_file", 1)
+
     return settings
 
 
@@ -471,6 +498,103 @@ async def get_referral_stats(referrer_id: int) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Credits
+# credits: {_id: user_id, balance: int}
+# daily_claims: {_id: user_id, last_claim: iso}
+# --------------------------------------------------------------------------
+
+async def get_credits(user_id: int) -> int:
+    doc = await _db().credits.find_one({"_id": user_id})
+    return doc["balance"] if doc else 0
+
+
+async def add_credits(user_id: int, amount: int) -> int:
+    """Adds (or subtracts, if amount is negative) credits and returns the
+    new balance."""
+    doc = await _db().credits.find_one_and_update(
+        {"_id": user_id},
+        {"$inc": {"balance": amount}},
+        upsert=True,
+        return_document=True,
+    )
+    return doc["balance"]
+
+
+async def deduct_credit(user_id: int, cost: int = 1) -> bool:
+    """Atomically spends `cost` credits. Returns False (and changes
+    nothing) if the balance is too low — so concurrent requests can never
+    push a balance negative."""
+    res = await _db().credits.update_one(
+        {"_id": user_id, "balance": {"$gte": cost}},
+        {"$inc": {"balance": -cost}},
+    )
+    return res.modified_count == 1
+
+
+async def get_credit_cost_per_file() -> int:
+    return (await _settings())["credit_cost_per_file"]
+
+
+async def set_credit_cost_per_file(cost: int) -> None:
+    await _set(credit_cost_per_file=cost)
+
+
+async def is_daily_credit_enabled() -> bool:
+    return (await _settings())["daily_credit"]["enabled"]
+
+
+async def set_daily_credit_enabled(value: bool) -> None:
+    await _set(**{"daily_credit.enabled": value})
+
+
+async def get_daily_credit_amount() -> int:
+    return (await _settings())["daily_credit"]["amount"]
+
+
+async def set_daily_credit_amount(amount: int) -> None:
+    await _set(**{"daily_credit.amount": amount})
+
+
+async def claim_daily_credit(user_id: int) -> tuple[bool, int | timedelta]:
+    """Grants the daily credit if 24h have passed since the user's last
+    claim. Returns (True, new_balance) on success, or
+    (False, time_remaining) if they need to wait."""
+    async with DATA_LOCK:
+        now = datetime.now(timezone.utc)
+        doc = await _db().daily_claims.find_one({"_id": user_id})
+        if doc:
+            last = datetime.fromisoformat(doc["last_claim"])
+            elapsed = now - last
+            if elapsed < timedelta(hours=24):
+                return False, timedelta(hours=24) - elapsed
+        amount = await get_daily_credit_amount()
+        await _db().daily_claims.update_one(
+            {"_id": user_id}, {"$set": {"last_claim": now.isoformat()}}, upsert=True
+        )
+        new_balance = await add_credits(user_id, amount)
+        return True, new_balance
+
+
+async def get_referral_reward_credits() -> int:
+    return (await _settings())["referral_reward_credits"]
+
+
+async def set_referral_reward_credits(amount: int) -> None:
+    await _set(referral_reward_credits=amount)
+
+
+async def maybe_reward_referral_credits(referred_id: int) -> None:
+    """Call after a referred user's first credit-earning action (shortener
+    completion or a purchase). Rewards their referrer once, in credits."""
+    referral = await get_referral(referred_id)
+    if not referral or referral.get("rewarded"):
+        return
+    reward = await get_referral_reward_credits()
+    await add_credits(referral["referrer_id"], reward)
+    await mark_referral_rewarded(referred_id)
+
+
+# --------------------------------------------------------------------------
 # Link shorteners (admin-only, multiple)
 # settings["shorteners"] = [
 #     {"id": "a1b2c3d4", "name": "GPLinks", "api_domain": "api.gplinks.com",
@@ -479,21 +603,33 @@ async def get_referral_stats(referrer_id: int) -> dict:
 # --------------------------------------------------------------------------
 
 async def list_shorteners() -> list[dict]:
-    return list((await _settings())["shorteners"])
+    shorteners = list((await _settings())["shorteners"])
+    for s in shorteners:
+        s.setdefault("reward_credits", 5)
+    return shorteners
 
 
-async def add_shortener(name: str, api_domain: str, api_key: str) -> dict:
+async def add_shortener(name: str, api_domain: str, api_key: str, reward_credits: int = 5) -> dict:
     entry = {
         "id": uuid.uuid4().hex[:8],
         "name": name,
         "api_domain": api_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/"),
         "api_key": api_key.strip(),
         "enabled": True,
+        "reward_credits": reward_credits,
     }
     await _db().settings.update_one(
         {"_id": _SETTINGS_ID}, {"$push": {"shorteners": entry}}, upsert=True
     )
     return entry
+
+
+async def set_shortener_reward(shortener_id: str, reward_credits: int) -> bool:
+    res = await _db().settings.update_one(
+        {"_id": _SETTINGS_ID, "shorteners.id": shortener_id},
+        {"$set": {"shorteners.$.reward_credits": reward_credits}},
+    )
+    return res.modified_count == 1
 
 
 async def remove_shortener(shortener_id: str) -> bool:
@@ -518,13 +654,16 @@ async def toggle_shortener(shortener_id: str) -> bool | None:
         return None
 
 
-async def shorten_url(long_url: str) -> str:
-    """Shortens `long_url` with a randomly-picked enabled shortener
-    (GPLinks-style API: GET https://<domain>/api?api=<key>&url=<url>
-    -> {"status": "success", "shortenedUrl": "..."}). Falls back to the
-    original long_url if none are configured or the request fails, so
-    the bot degrades gracefully instead of blocking users."""
+async def shorten_url(long_url: str, shortener_id: str | None = None) -> str:
+    """Shortens `long_url`. If `shortener_id` is given, uses that specific
+    shortener; otherwise picks randomly among enabled ones (GPLinks-style
+    API: GET https://<domain>/api?api=<key>&url=<url> ->
+    {"status": "success", "shortenedUrl": "..."}). Falls back to the
+    original long_url if none are configured/found or the request fails,
+    so the bot degrades gracefully instead of blocking users."""
     shorteners = [s for s in await list_shorteners() if s.get("enabled")]
+    if shortener_id:
+        shorteners = [s for s in shorteners if s["id"] == shortener_id]
     if not shorteners:
         return long_url
     chosen = random.choice(shorteners)
@@ -581,6 +720,45 @@ async def set_verified(user_id: int, hours: int) -> str:
         {"_id": user_id}, {"$set": {"expiry": expiry}}, upsert=True
     )
     return expiry
+
+
+# --------------------------------------------------------------------------
+# Single-use verification tokens
+#
+# Used for BOTH the free-user file-access gate ("token verification") and
+# earning credits via a shortener. A token is only ever redeemable once,
+# and only by the Telegram user it was created for — this replaces an
+# earlier scheme that just embedded the user id in the token itself
+# (guessable/reusable by anyone, not a real security check).
+# --------------------------------------------------------------------------
+
+async def create_verify_token(user_id: int, purpose: str,
+                               shortener_id: str | None = None,
+                               reward_credits: int = 0) -> str:
+    token = uuid.uuid4().hex
+    await _db().verify_tokens.insert_one({
+        "_id": token,
+        "user_id": user_id,
+        "purpose": purpose,  # "gate" or "credit"
+        "shortener_id": shortener_id,
+        "reward_credits": reward_credits,
+        "created_at": datetime.now(timezone.utc),
+        "used": False,
+    })
+    return token
+
+
+async def consume_verify_token(token: str, clicking_user_id: int) -> dict | None:
+    """Atomically marks a token used — only if it exists, is unused, and
+    belongs to the user clicking it. Returns the token doc on success
+    (with "_id" popped), or None if invalid/already used/not theirs."""
+    res = await _db().verify_tokens.find_one_and_update(
+        {"_id": token, "user_id": clicking_user_id, "used": False},
+        {"$set": {"used": True, "used_at": _now_iso()}},
+    )
+    if res:
+        res.pop("_id", None)
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -776,46 +954,63 @@ async def process_payu_response(params: dict, bot) -> tuple[bool, str]:
         return True, "already processed"
 
     if status == "success":
-        # Extend on top of any remaining active premium instead of
-        # overwriting it, so buying/extending never shortens a plan.
         # PayU fires both a webhook and a browser redirect; only the caller
-        # that atomically claims the transaction may grant premium.
+        # that atomically claims the transaction may grant premium/credits.
         if not await claim_transaction_success(txnid):
             return True, "already processed"
-        try:
-            new_expiry_iso = await grant_premium_days(txn["user_id"], txn["plan_days"])
-        except Exception:
-            await unclaim_transaction(txnid)
-            raise
-        expiry = datetime.fromisoformat(new_expiry_iso)
-        try:
-            await bot.send_message(
-                chat_id=txn["chat_id"],
-                text=(
-                    "✅ Payment successful!\n\n"
-                    f"Your {txn.get('plan_label', PLAN_LABEL)} is active "
-                    f"until {expiry.strftime('%d %b %Y')}."
-                ),
-            )
-        except Exception:
-            logger.exception("Could not notify user %s", txn["user_id"])
+
+        kind = txn.get("kind", "premium")
+
+        if kind == "credits":
+            credits_bought = txn.get("credits", 0)
+            new_balance = await add_credits(txn["user_id"], credits_bought)
+            try:
+                await bot.send_message(
+                    chat_id=txn["chat_id"],
+                    text=(
+                        "✅ Payment successful!\n\n"
+                        f"🪙 {credits_bought} credits added. New balance: {new_balance}."
+                    ),
+                )
+            except Exception:
+                logger.exception("Could not notify user %s", txn["user_id"])
+        else:
+            # Extend on top of any remaining active premium instead of
+            # overwriting it, so buying/extending never shortens a plan.
+            try:
+                new_expiry_iso = await grant_premium_days(txn["user_id"], txn["plan_days"])
+            except Exception:
+                await unclaim_transaction(txnid)
+                raise
+            expiry = datetime.fromisoformat(new_expiry_iso)
+            try:
+                await bot.send_message(
+                    chat_id=txn["chat_id"],
+                    text=(
+                        "✅ Payment successful!\n\n"
+                        f"Your {txn.get('plan_label', PLAN_LABEL)} is active "
+                        f"until {expiry.strftime('%d %b %Y')}."
+                    ),
+                )
+            except Exception:
+                logger.exception("Could not notify user %s", txn["user_id"])
 
         # Refer & Earn: if this buyer was referred and hasn't triggered a
-        # reward yet, give the referrer 1 free day of premium.
+        # reward yet, give the referrer credits.
         try:
             referral = await get_referral(txn["user_id"])
             if referral and not referral.get("rewarded"):
                 referrer_id = referral["referrer_id"]
-                new_expiry = await grant_premium_days(referrer_id, 1)
+                reward = await get_referral_reward_credits()
+                new_balance = await add_credits(referrer_id, reward)
                 await mark_referral_rewarded(txn["user_id"])
                 try:
                     await bot.send_message(
                         chat_id=referrer_id,
                         text=(
-                            "🎁 Your referral just purchased Premium! You've "
-                            "earned +1 day of Premium.\n"
-                            f"Your premium is now valid until "
-                            f"{datetime.fromisoformat(new_expiry).strftime('%d %b %Y')}."
+                            "🎁 Your referral just made a purchase! You've "
+                            f"earned +{reward} credits.\n"
+                            f"Your credit balance is now {new_balance}."
                         ),
                     )
                 except Exception:
@@ -1216,19 +1411,23 @@ async def handle_success(request: web.Request) -> web.Response:
         )
         return web.Response(text=page, content_type="text/html")
 
-    subtitle = "Your premium plan is now active."
+    subtitle = "Your purchase is now active."
     txnid = params.get("txnid")
     if txnid:
         txn = await get_transaction(txnid)
         if txn:
-            expiry_iso = await get_premium_expiry(txn["user_id"])
-            if expiry_iso:
-                try:
-                    expiry = datetime.fromisoformat(expiry_iso)
-                    plan_label = txn.get("plan_label", PLAN_LABEL)
-                    subtitle = f"{plan_label} is active until {expiry.strftime('%d %b %Y')}."
-                except Exception:
-                    pass
+            if txn.get("kind") == "credits":
+                balance = await get_credits(txn["user_id"])
+                subtitle = f"{txn.get('credits', 0)} credits added. Balance: {balance}."
+            else:
+                expiry_iso = await get_premium_expiry(txn["user_id"])
+                if expiry_iso:
+                    try:
+                        expiry = datetime.fromisoformat(expiry_iso)
+                        plan_label = txn.get("plan_label", PLAN_LABEL)
+                        subtitle = f"{plan_label} is active until {expiry.strftime('%d %b %Y')}."
+                    except Exception:
+                        pass
 
     page = _success_page(
         subtitle=subtitle,
