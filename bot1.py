@@ -40,6 +40,7 @@ import token_verification
 import force_subscribe
 import file_settings
 import famgateway
+import file_store
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -501,6 +502,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 referrer_id = int(ref_part)
                 await referral.record_referral(referred_id=user.id, referrer_id=referrer_id)
 
+        elif payload.startswith("file_"):
+            await deliver_link(context, user, update.effective_chat.id, payload[len("file_"):])
+            return
+
         elif payload.startswith("verify_"):
             token = payload[len("verify_"):]
             doc = await token_verification.consume_verify_token(token, user.id)
@@ -524,16 +529,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:  # "gate" — free-user file-access verification
                 hours = await token_verification.get_verification_validity_hours()
                 await token_verification.set_verified(user.id, hours)
+                resume = doc.get("payload")
                 await update.message.reply_text(
                     "✅ " + to_bold_unicode(
                         f"Verified! Ab agle {hours} ghante tak aap files "
                         "access kar sakte hain."
                     )
-                    + "\n\n" + to_bold_unicode(
-                        "Jo file link khola tha, wapas wahi link se try karein."
-                    ),
+                    + ("\n\n" + to_bold_unicode("Aapki file bhej rahe hain…") if resume else ""),
                     parse_mode=ParseMode.HTML,
                 )
+                if resume:
+                    await deliver_link(context, user, update.effective_chat.id, resume)
             return
 
     await update.message.reply_text(
@@ -649,11 +655,12 @@ def build_fsub_menu_keyboard(channels: list[dict], admin_view: bool) -> InlineKe
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_fsub_join_keyboard(unjoined: list[dict]) -> InlineKeyboardMarkup:
+def build_fsub_join_keyboard(unjoined: list[dict], link_id: str | None = None) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton(f"📢 Join {c['title']}", url=c["invite_link"])] for c in unjoined
     ]
-    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="fsub_recheck")])
+    recheck = f"fsub_recheck_{link_id}" if link_id else "fsub_recheck"
+    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data=recheck)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -806,47 +813,19 @@ def build_protect_content_menu_keyboard(enabled: bool, admin_view: bool) -> Inli
 
 
 # ============================================================
-# Integration helpers — for the file-storage/delivery system
-# (currently under maintenance, so not part of this file). Once it's
-# back, wire it up like this before/around sending a file:
+# File delivery
 #
-#   1. Force Subscribe gate (skip if disabled):
-#        unjoined = await force_subscribe.get_unjoined_channels(bot, user.id)
-#        if unjoined:
-#            await message.reply_text(text, reply_markup=build_fsub_join_keyboard(unjoined))
-#            return
-#
-#   2. Token verification gate (skip for premium users):
-#        if not await premium.is_premium(user.id) \
-#           and await token_verification.is_token_verification_enabled() \
-#           and not await token_verification.is_verified(user.id):
-#                me = await context.bot.get_me()
-#                token = await token_verification.create_verify_token(user.id, purpose="gate")
-#                long_link = build_verification_deep_link(me.username, token)
-#                short_link = await shortener_store.shorten_url(long_link)
-#                await message.reply_text(f"Verify here: {short_link}")
-#                return
-#
-#   2b. Credit gate (skip for premium users — everyone else spends
-#       credits per file; send them to the Credits menu if they're short):
-#        if not await premium.is_premium(user.id):
-#            cost = await credits.get_credit_cost_per_file()
-#            if not await credits.deduct_credit(user.id, cost):
-#                await message.reply_text(
-#                    "🪙 Not enough credits. Earn more from the Credits menu."
-#                )
-#                return
-#
-#   3. Caption / thumbnail / button / protect content when sending:
-#        caption = await build_final_caption(original_caption, filename=.., filesize=..)
-#        thumb   = await file_settings.get_thumbnail_file_id() if await file_settings.is_thumbnail_enabled() else None
-#        markup  = await build_extra_button_markup()
-#        protect = await file_settings.is_protect_content_enabled()
-#        sent = await bot.send_document(..., caption=caption, thumbnail=thumb,
-#                                        reply_markup=markup, protect_content=protect)
-#
-#   4. Auto delete after sending:
-#        await schedule_auto_delete(context.bot, sent.chat_id, sent.message_id)
+# Opening a file link (t.me/<bot>?start=file_<id>) runs these gates, in order:
+#   1. Force-subscribe: must have joined every listed channel.
+#   2. Access — the FIRST of these that applies lets the user through:
+#        - admin or premium user                       (free, unlimited)
+#        - token verification on AND user is verified  (free until it expires)
+#        - free daily quota left (Free usage limit)    (free, counted per day)
+#        - enough credits                              (costs credits/file)
+#      Otherwise the user gets a prompt: verify / earn credits / buy premium.
+#   3. Files are sent with the caption / thumbnail / button / protect-content
+#      settings, then scheduled for auto-delete.
+# A link costs ONE access (or one credit) no matter how many files a batch has.
 # ============================================================
 
 async def build_final_caption(default_caption: str, **placeholders) -> str:
@@ -882,6 +861,226 @@ async def schedule_auto_delete(bot, chat_id: int, message_id: int) -> None:
             pass
 
     asyncio.create_task(_delete_later())
+
+
+_thumb_cache: dict = {"file_id": None, "data": None}
+
+
+async def _get_thumbnail_bytes(bot) -> bytes | None:
+    """Downloads (and caches) the admin's thumbnail image, if enabled."""
+    if not await file_settings.is_thumbnail_enabled():
+        return None
+    file_id = await file_settings.get_thumbnail_file_id()
+    if not file_id:
+        return None
+    if _thumb_cache["file_id"] != file_id:
+        try:
+            tg_file = await bot.get_file(file_id)
+            _thumb_cache["data"] = bytes(await tg_file.download_as_bytearray())
+            _thumb_cache["file_id"] = file_id
+        except Exception:
+            logger.exception("Could not download thumbnail")
+            return None
+    return _thumb_cache["data"]
+
+
+async def _send_link_items(bot, chat_id: int, link: dict) -> int:
+    """Sends every file of a saved link. Returns how many were delivered."""
+    protect = await file_settings.is_protect_content_enabled()
+    markup = await build_extra_button_markup()
+    thumb = await _get_thumbnail_bytes(bot)
+    senders = {
+        "document": (bot.send_document, "document", True),
+        "video": (bot.send_video, "video", True),
+        "audio": (bot.send_audio, "audio", True),
+        "animation": (bot.send_animation, "animation", True),
+        "voice": (bot.send_voice, "voice", False),
+        "photo": (bot.send_photo, "photo", False),
+    }
+    delivered = 0
+    for item in link["items"]:
+        entry = senders.get(item["type"])
+        if entry is None:
+            continue
+        send, arg, supports_thumb = entry
+        caption = await build_final_caption(
+            item.get("caption") or "",
+            filename=item.get("name") or "",
+            filesize=file_store.format_size(item.get("size")),
+            caption=item.get("caption") or "",
+        )
+        kwargs = {
+            "chat_id": chat_id, arg: item["file_id"],
+            "caption": caption or None,
+            "reply_markup": markup, "protect_content": protect,
+        }
+        try:
+            if supports_thumb and thumb:
+                try:
+                    sent = await send(**kwargs, thumbnail=thumb)
+                except Exception:
+                    sent = await send(**kwargs)  # thumbnail rejected -> plain send
+            else:
+                sent = await send(**kwargs)
+        except Exception:
+            logger.exception("Could not send file %s of link %s", item.get("file_id"), link["id"])
+            continue
+        delivered += 1
+        await schedule_auto_delete(bot, sent.chat_id, sent.message_id)
+    return delivered
+
+
+async def _access_prompt(context, user, link_id: str, balance: int, cost: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Message + buttons shown to a user who can't open the file yet."""
+    rows = []
+    lines = [
+        "🔒 " + to_bold_unicode("Is file ko kholne ke liye access chahiye."),
+        "",
+        "<blockquote>"
+        + "🪙 " + to_bold_unicode(f"Aapke credits: {balance} (1 file link = {cost} credit)")
+        + "</blockquote>",
+    ]
+    if await token_verification.is_token_verification_enabled():
+        shorteners_on = [s for s in await shortener_store.list_shorteners() if s.get("enabled")]
+        if shorteners_on:
+            hours = await token_verification.get_verification_validity_hours()
+            me = await context.bot.get_me()
+            token = await token_verification.create_verify_token(
+                user.id, purpose="gate", payload=link_id
+            )
+            short_link = await shortener_store.shorten_url(
+                build_verification_deep_link(me.username, token)
+            )
+            rows.append([InlineKeyboardButton(f"✅ Verify — {hours}h free access", url=short_link)])
+    rows.append([InlineKeyboardButton("🪙 Earn / Buy credits", callback_data="credits_menu")])
+    rows.append([InlineKeyboardButton("💎 Buy Premium", callback_data="settings_premium")])
+    rows.append([InlineKeyboardButton("🔄 Try again", callback_data=f"file_retry_{link_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def deliver_link(context, user, chat_id: int, link_id: str) -> None:
+    """Runs the gates for `link_id` and, if the user passes, sends the files."""
+    bot = context.bot
+    link = await file_store.get_link(link_id)
+    if not link:
+        await bot.send_message(chat_id=chat_id, text="⚠️ Yeh link invalid hai ya hata diya gaya hai.")
+        return
+
+    # 1. Force subscribe
+    unjoined = await force_subscribe.get_unjoined_channels(bot, user.id)
+    if unjoined:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="📢 " + to_bold_unicode("File paane ke liye pehle neeche ke channels join karein."),
+            reply_markup=build_fsub_join_keyboard(unjoined, link_id),
+        )
+        return
+
+    # 2. Access. `refund` undoes whatever was spent if sending then fails.
+    refund = None
+    if is_admin(user.id) or await premium.is_premium(user.id):
+        pass
+    elif (await token_verification.is_token_verification_enabled()
+          and await token_verification.is_verified(user.id)):
+        pass
+    elif await file_settings.try_use_free_quota(user.id):
+        async def refund():
+            await file_settings.refund_free_quota(user.id)
+    else:
+        cost = await credits.get_credit_cost_per_file()
+        if cost <= 0:
+            pass  # admin set files to cost nothing
+        elif await credits.deduct_credit(user.id, cost):
+            async def refund():
+                await credits.add_credits(user.id, cost)
+        else:
+            balance = await credits.get_credits(user.id)
+            text, keyboard = await _access_prompt(context, user, link_id, balance, cost)
+            await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+            )
+            return
+
+    # 3. Send
+    delivered = 0
+    try:
+        delivered = await _send_link_items(bot, chat_id, link)
+    finally:
+        if delivered == 0 and refund is not None:
+            try:
+                await refund()
+            except Exception:
+                logger.exception("Refund failed for user %s", user.id)
+    if delivered == 0:
+        await bot.send_message(
+            chat_id=chat_id, text="⚠️ File bhejne mein dikkat aayi. Aapka access wapas kar diya gaya hai."
+        )
+        return
+    await file_store.record_download(link_id)
+    if await file_settings.is_auto_delete_enabled():
+        minutes = max(1, (await file_settings.get_auto_delete_seconds()) // 60)
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⏳ " + to_bold_unicode(
+                f"Yeh file {minutes} minute mein delete ho jayegi. Pehle hi save/forward kar lein."
+            ),
+        )
+
+
+# ---------------- Saving files (admin) ----------------
+
+async def _finish_store(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list[dict]) -> None:
+    link_id = await file_store.create_link(items, update.effective_user.id)
+    me = await context.bot.get_me()
+    await update.message.reply_text(
+        f"✅ Saved {len(items)} file(s).\n\n"
+        f"🔗 https://t.me/{me.username}?start=file_{link_id}",
+        disable_web_page_preview=True,
+    )
+
+
+async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Admins only.")
+        return
+    replied = update.message.reply_to_message
+    if replied:
+        item = file_store.extract_media(replied)
+        if item:
+            await _finish_store(update, context, [item])
+            return
+    context.user_data["awaiting"] = "store_single"
+    await update.message.reply_text(
+        "📤 Ab wo file bhejo jiska link banana hai (document / video / audio / photo).\n"
+        "Cancel: /cancel"
+    )
+
+
+async def batch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Admins only.")
+        return
+    context.user_data["awaiting"] = "store_batch"
+    context.user_data["batch_items"] = []
+    await update.message.reply_text(
+        f"📦 Batch mode on. Files ek ek karke bhejo (max {file_store.MAX_BATCH_ITEMS}).\n"
+        "Khatam hone par /done bhejo. Cancel: /cancel"
+    )
+
+
+async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if context.user_data.get("awaiting") != "store_batch":
+        await update.message.reply_text("Koi batch chal nahi raha. /batch se shuru karo.")
+        return
+    items = context.user_data.get("batch_items") or []
+    if not items:
+        await update.message.reply_text("Abhi tak koi file add nahi hui.")
+        return
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("batch_items", None)
+    await _finish_store(update, context, items)
 
 
 SETTINGS_PLACEHOLDER_CALLBACKS = {
@@ -1057,12 +1256,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if data == "fsub_recheck":
+    if data == "fsub_recheck" or data.startswith("fsub_recheck_"):
         unjoined = await force_subscribe.get_unjoined_channels(context.bot, user.id)
         if unjoined:
             await query.answer("Abhi bhi kuch channels baaki hain ❌", show_alert=True)
-        else:
-            await query.answer("✅ Sab channels joined! Ab file access kar sakte hain.", show_alert=True)
+            return
+        await query.answer("✅ Sab channels joined!", show_alert=True)
+        if data.startswith("fsub_recheck_"):
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await deliver_link(context, user, update.effective_chat.id, data[len("fsub_recheck_"):])
+        return
+
+    if data.startswith("file_retry_"):
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await deliver_link(context, user, update.effective_chat.id, data[len("file_retry_"):])
         return
     # --------------------------------------------------------------------
 
@@ -2179,7 +2393,29 @@ async def admin_photo_reply_handler(update: Update, context: ContextTypes.DEFAUL
     """Captures the next photo after an admin taps Premium Plan Picture or
     Set Thumbnail."""
     awaiting = context.user_data.get("awaiting")
+
+    # Saving files for /link and /batch (any media type).
+    if awaiting in ("store_single", "store_batch"):
+        if not is_admin(update.effective_user.id):
+            return
+        item = file_store.extract_media(update.message)
+        if item is None:
+            return
+        if awaiting == "store_single":
+            context.user_data.pop("awaiting", None)
+            await _finish_store(update, context, [item])
+        else:
+            items = context.user_data.setdefault("batch_items", [])
+            if len(items) >= file_store.MAX_BATCH_ITEMS:
+                await update.message.reply_text("⚠️ Batch full. /done bhejo.")
+                return
+            items.append(item)
+            await update.message.reply_text(f"➕ Added ({len(items)}). Aur bhejo ya /done.")
+        return
+
     if awaiting not in ("premium_message_picture", "thumbnail_photo"):
+        return
+    if not update.message.photo:
         return
     if not is_admin(update.effective_user.id):
         return
@@ -2191,66 +2427,4 @@ async def admin_photo_reply_handler(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("✅ Premium plan picture updated.")
         return
 
-    if awaiting == "thumbnail_photo":
-        await file_settings.set_thumbnail_file_id(file_id)
-        context.user_data.pop("awaiting", None)
-        await update.message.reply_text("✅ Thumbnail updated.")
-        return
-
-
-async def main() -> None:
-    if BOT_TOKEN == "PUT-YOUR-BOT-TOKEN-HERE":
-        raise SystemExit(
-            "Set your bot token first: export BOT_TOKEN='123456:ABC-DEF...'"
-        )
-
-    # MongoDB must be reachable before anything else starts.
-    await db.init_db()
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("buy", buy))
-    application.add_handler(CommandHandler("id", id_cmd))
-    application.add_handler(CommandHandler("myplan", myplan))
-    application.add_handler(CommandHandler("credits", credits_cmd))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.PHOTO, admin_photo_reply_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_reply_handler))
-
-    # --- Telegram bot: start polling (manual lifecycle, not the blocking
-    # run_polling() helper, so it can run alongside the aiohttp server in
-    # the same asyncio loop) ---
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    me = await application.bot.get_me()
-    logger.info("Bot @%s started (polling)", me.username)
-
-    # --- FamGateway webhook HTTP server ---
-    web_app = famgateway.build_web_app(application.bot)
-    web_app["bot_username"] = me.username
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("FamGateway webhook server listening on port %s", port)
-
-    # Re-attach pollers to payments that were mid-flight during the last restart.
-    await famgateway.resume_pending(application.bot)
-
-    try:
-        await asyncio.Event().wait()  # run forever
-    finally:
-        await runner.cleanup()
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        await famgateway.shutdown()
-        await db.close_db()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if awa
