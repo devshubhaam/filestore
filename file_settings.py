@@ -4,6 +4,7 @@ protect-content and the free usage limit."""
 
 
 import logging
+from datetime import datetime, timezone
 
 import db
 
@@ -104,3 +105,39 @@ async def get_free_limit_count() -> int:
 
 async def set_free_limit_count(count: int) -> None:
     await db.set_settings(free_limit_count=count)
+
+
+async def try_use_free_quota(user_id: int) -> bool:
+    """Spends one of the user's free file opens for today (UTC day).
+    Returns False if the free limit is off, is 0, or is already used up.
+    Every step is one atomic Mongo operation, so concurrent requests can't
+    exceed the limit."""
+    if not await is_free_limit_enabled():
+        return False
+    limit = await get_free_limit_count()
+    if limit <= 0:
+        return False
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    col = db.get_db().free_usage
+    # Same day, still under the limit.
+    res = await col.update_one(
+        {"_id": user_id, "date": today, "count": {"$lt": limit}}, {"$inc": {"count": 1}}
+    )
+    if res.modified_count == 1:
+        return True
+    # A previous day's record -> start today's count at 1.
+    res = await col.update_one({"_id": user_id, "date": {"$ne": today}},
+                               {"$set": {"date": today, "count": 1}})
+    if res.modified_count == 1:
+        return True
+    # Never used before -> create the record (does nothing if it exists).
+    res = await col.update_one({"_id": user_id}, {"$setOnInsert": {"date": today, "count": 1}},
+                               upsert=True)
+    return res.upserted_id is not None
+
+
+async def refund_free_quota(user_id: int) -> None:
+    """Gives back one free open (used if sending the file failed)."""
+    await db.get_db().free_usage.update_one(
+        {"_id": user_id, "count": {"$gt": 0}}, {"$inc": {"count": -1}}
+    )
