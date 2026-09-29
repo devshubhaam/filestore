@@ -61,7 +61,8 @@ async def set_verified(user_id: int, hours: int) -> str:
 
 async def create_verify_token(user_id: int, purpose: str,
                                shortener_id: str | None = None,
-                               reward_credits: int = 0) -> str:
+                               reward_credits: int = 0,
+                               payload: str | None = None) -> str:
     token = uuid.uuid4().hex
     await db.get_db().verify_tokens.insert_one({
         "_id": token,
@@ -69,6 +70,7 @@ async def create_verify_token(user_id: int, purpose: str,
         "purpose": purpose,  # "gate" or "credit"
         "shortener_id": shortener_id,
         "reward_credits": reward_credits,
+        "payload": payload,  # e.g. the file link to resume after verifying
         "created_at": datetime.now(timezone.utc),
         "used": False,
     })
