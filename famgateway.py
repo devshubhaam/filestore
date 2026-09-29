@@ -138,6 +138,13 @@ async def get_order_status(order_id: str) -> dict:
     Returns {"state": "success" | "pending" | "expired" | "error", ...}
     and, for "success": utr, amount, sender_name."""
     status, data = await _call("GET", "/api/verify-order.php", params={"order_id": order_id})
+    if status == 401:
+        # Header auth was refused — retry once with the query-param form
+        # the docs also support.
+        status, data = await _call(
+            "GET", "/api/verify-order.php",
+            params={"order_id": order_id, "api_key": FAMGATEWAY_API_KEY},
+        )
     st = data.get("status")
     if st == "success":
         d = data.get("data") if isinstance(data.get("data"), dict) else data
@@ -289,11 +296,19 @@ async def _poll_order(bot, order_id: str, deadline_ts: float) -> None:
                 logger.warning("Poll %s: %s", order_id, exc)
                 continue
             if st["state"] == "success":
-                await fulfill_order(order_id, bot, st.get("utr", ""), st.get("amount"))
+                logger.info("Order %s confirmed by gateway (utr=%s)", order_id, st.get("utr"))
+                try:
+                    result = await fulfill_order(order_id, bot, st.get("utr", ""), st.get("amount"))
+                except Exception:
+                    logger.exception("Fulfilment of %s failed — will retry", order_id)
+                    continue
+                logger.info("Order %s fulfilment result: %s", order_id, result)
                 return
             if st["state"] == "expired":
                 await _expire_order(bot, order_id)
                 return
+            if st["state"] == "error":
+                logger.warning("Poll %s: gateway error: %s", order_id, st.get("message"))
         # Ran out of time without a definite answer.
         await _expire_order(bot, order_id)
     except asyncio.CancelledError:
