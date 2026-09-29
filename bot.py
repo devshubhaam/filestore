@@ -31,7 +31,15 @@ from telegram.ext import (
 )
 from aiohttp import web
 
-import payments
+import db
+import premium
+import credits
+import referral
+import shorteners as shortener_store
+import token_verification
+import force_subscribe
+import file_settings
+import famgateway
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -376,7 +384,7 @@ def build_credits_buy_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             f"🪙 {p['credits']} credits - ₹{p['amount']}", callback_data=f"creditpack_{p['id']}"
         )]
-        for p in payments.CREDIT_PACKS
+        for p in credits.CREDIT_PACKS
     ]
     keyboard.append([InlineKeyboardButton("◀ Back", callback_data="credits_menu")])
     return InlineKeyboardMarkup(keyboard)
@@ -405,49 +413,38 @@ def build_credits_admin_keyboard(daily_enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-async def build_credit_buy_offer(user, chat_id, pack_id: str):
-    """Creates a pending PayU transaction for a credit pack. Returns
-    (text, keyboard), None if PayU isn't configured, or "invalid_pack"."""
-    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+async def start_credit_checkout(bot, user, chat_id, pack_id: str):
+    """Creates a FamGateway order for a credit pack and sends the QR
+    message. Returns the order dict, None if the gateway isn't configured,
+    "invalid_pack", or "error" if the gateway couldn't create the order."""
+    if not famgateway.is_configured():
         return None
-    pack = payments.get_credit_pack(pack_id)
+    pack = credits.get_credit_pack(pack_id)
     if pack is None:
         return "invalid_pack"
 
-    txnid = uuid.uuid4().hex[:20]
-    txn = {
-        "user_id": user.id,
-        "chat_id": chat_id,
-        "kind": "credits",
-        "amount": pack["amount"],
-        "credits": pack["credits"],
-        "plan_label": f"{pack['credits']} Credits",
-        "firstname": user.first_name or "User",
-        "email": f"user{user.id}@telegram.local",
-        "phone": "9999999999",
-        "status": "pending",
-    }
-    await payments.save_transaction(txnid, txn)
-
-    pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"💳 Pay ₹{pack['amount']} now", url=pay_url)],
-            [InlineKeyboardButton("◀ Back", callback_data="credits_buy")],
-        ]
-    )
-    text = (
-        "🪙 " + to_bold_unicode(f"{pack['credits']} Credits - ₹{pack['amount']}")
-        + "\n\n"
-        + "<blockquote>"
-        + "💳 " + to_bold_unicode(
-            "Pay via UPI, UPI QR, cards, netbanking or wallet — all shown "
-            "on the payment page."
+    def caption(order):
+        price = order.get("payable_amount") or pack["amount"]
+        return (
+            "🪙 " + to_bold_unicode(f"{pack['credits']} Credits - ₹{price}")
+            + "\n\n<blockquote>"
+            + "📲 " + to_bold_unicode("Scan this QR with any UPI app, or tap the button below.") + "\n"
+            + "⚡ " + to_bold_unicode("Credits are added automatically after payment.") + "\n"
+            + "⏳ " + to_bold_unicode("This QR is valid for 5 minutes.")
+            + "</blockquote>\n\n"
+            + "🧾 " + to_bold_unicode("Order:") + f" <code>{order['order_id']}</code>"
         )
-        + "</blockquote>\n\n"
-        + to_bold_unicode("Tap the button below to pay.")
-    )
-    return text, keyboard
+
+    try:
+        return await famgateway.start_checkout(
+            bot, user=user, chat_id=chat_id, kind="credits", amount=pack["amount"],
+            txn_fields={"credits": pack["credits"], "plan_label": f"{pack['credits']} Credits"},
+            caption_fn=caption,
+            extra_buttons=[[InlineKeyboardButton("◀ Back", callback_data="credits_buy")]],
+        )
+    except famgateway.FamGatewayError:
+        logger.exception("FamGateway order creation failed (credit pack %s)", pack_id)
+        return "error"
 
 
 def build_start_text(user_first_name: str) -> str:
@@ -491,7 +488,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
     try:
-        await payments.register_user(user)
+        await db.register_user(user)
     except Exception:
         logger.exception("Could not save user %s to MongoDB", user.id)
 
@@ -502,11 +499,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ref_part = payload[len("ref_"):]
             if ref_part.isdigit():
                 referrer_id = int(ref_part)
-                await payments.record_referral(referred_id=user.id, referrer_id=referrer_id)
+                await referral.record_referral(referred_id=user.id, referrer_id=referrer_id)
 
         elif payload.startswith("verify_"):
             token = payload[len("verify_"):]
-            doc = await payments.consume_verify_token(token, user.id)
+            doc = await token_verification.consume_verify_token(token, user.id)
             if doc is None:
                 await update.message.reply_text(
                     "⚠️ " + to_bold_unicode(
@@ -517,16 +514,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
             if doc["purpose"] == "credit":
-                new_balance = await payments.add_credits(user.id, doc["reward_credits"])
-                await payments.maybe_reward_referral_credits(user.id)
+                new_balance = await credits.add_credits(user.id, doc["reward_credits"])
+                await referral.maybe_reward_referral_credits(user.id, context.bot)
                 await update.message.reply_text(
                     "✅ " + to_bold_unicode(
                         f"+{doc['reward_credits']} credits mile! Naya balance: {new_balance}."
                     ),
                 )
             else:  # "gate" — free-user file-access verification
-                hours = await payments.get_verification_validity_hours()
-                await payments.set_verified(user.id, hours)
+                hours = await token_verification.get_verification_validity_hours()
+                await token_verification.set_verified(user.id, hours)
                 await update.message.reply_text(
                     "✅ " + to_bold_unicode(
                         f"Verified! Ab agle {hours} ghante tak aap files "
@@ -814,27 +811,27 @@ def build_protect_content_menu_keyboard(enabled: bool, admin_view: bool) -> Inli
 # back, wire it up like this before/around sending a file:
 #
 #   1. Force Subscribe gate (skip if disabled):
-#        unjoined = await payments.get_unjoined_channels(bot, user.id)
+#        unjoined = await force_subscribe.get_unjoined_channels(bot, user.id)
 #        if unjoined:
 #            await message.reply_text(text, reply_markup=build_fsub_join_keyboard(unjoined))
 #            return
 #
 #   2. Token verification gate (skip for premium users):
-#        if not await payments.is_premium(user.id) \
-#           and await payments.is_token_verification_enabled() \
-#           and not await payments.is_verified(user.id):
+#        if not await premium.is_premium(user.id) \
+#           and await token_verification.is_token_verification_enabled() \
+#           and not await token_verification.is_verified(user.id):
 #                me = await context.bot.get_me()
-#                token = await payments.create_verify_token(user.id, purpose="gate")
+#                token = await token_verification.create_verify_token(user.id, purpose="gate")
 #                long_link = build_verification_deep_link(me.username, token)
-#                short_link = await payments.shorten_url(long_link)
+#                short_link = await shortener_store.shorten_url(long_link)
 #                await message.reply_text(f"Verify here: {short_link}")
 #                return
 #
 #   2b. Credit gate (skip for premium users — everyone else spends
 #       credits per file; send them to the Credits menu if they're short):
-#        if not await payments.is_premium(user.id):
-#            cost = await payments.get_credit_cost_per_file()
-#            if not await payments.deduct_credit(user.id, cost):
+#        if not await premium.is_premium(user.id):
+#            cost = await credits.get_credit_cost_per_file()
+#            if not await credits.deduct_credit(user.id, cost):
 #                await message.reply_text(
 #                    "🪙 Not enough credits. Earn more from the Credits menu."
 #                )
@@ -842,9 +839,9 @@ def build_protect_content_menu_keyboard(enabled: bool, admin_view: bool) -> Inli
 #
 #   3. Caption / thumbnail / button / protect content when sending:
 #        caption = await build_final_caption(original_caption, filename=.., filesize=..)
-#        thumb   = await payments.get_thumbnail_file_id() if await payments.is_thumbnail_enabled() else None
+#        thumb   = await file_settings.get_thumbnail_file_id() if await file_settings.is_thumbnail_enabled() else None
 #        markup  = await build_extra_button_markup()
-#        protect = await payments.is_protect_content_enabled()
+#        protect = await file_settings.is_protect_content_enabled()
 #        sent = await bot.send_document(..., caption=caption, thumbnail=thumb,
 #                                        reply_markup=markup, protect_content=protect)
 #
@@ -853,8 +850,8 @@ def build_protect_content_menu_keyboard(enabled: bool, admin_view: bool) -> Inli
 # ============================================================
 
 async def build_final_caption(default_caption: str, **placeholders) -> str:
-    if await payments.is_caption_enabled():
-        template = await payments.get_caption_template()
+    if await file_settings.is_caption_enabled():
+        template = await file_settings.get_caption_template()
         if template:
             try:
                 return template.format(**placeholders)
@@ -864,18 +861,18 @@ async def build_final_caption(default_caption: str, **placeholders) -> str:
 
 
 async def build_extra_button_markup() -> InlineKeyboardMarkup | None:
-    if not await payments.is_custom_button_enabled():
+    if not await file_settings.is_custom_button_enabled():
         return None
-    btn = await payments.get_custom_button()
+    btn = await file_settings.get_custom_button()
     if btn.get("label") and btn.get("url"):
         return InlineKeyboardMarkup([[InlineKeyboardButton(btn["label"], url=btn["url"])]])
     return None
 
 
 async def schedule_auto_delete(bot, chat_id: int, message_id: int) -> None:
-    if not await payments.is_auto_delete_enabled():
+    if not await file_settings.is_auto_delete_enabled():
         return
-    seconds = await payments.get_auto_delete_seconds()
+    seconds = await file_settings.get_auto_delete_seconds()
 
     async def _delete_later():
         await asyncio.sleep(seconds)
@@ -908,7 +905,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("🚫 Admins only.", show_alert=True)
             return
         await query.answer()
-        shorteners = await payments.list_shorteners()
+        shorteners = await shortener_store.list_shorteners()
         await query.edit_message_text(
             text=build_shortener_menu_text(shorteners),
             parse_mode=ParseMode.HTML,
@@ -934,9 +931,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        await payments.toggle_shortener(data[len("short_toggle_"):])
+        await shortener_store.toggle_shortener(data[len("short_toggle_"):])
         await query.answer()
-        shorteners = await payments.list_shorteners()
+        shorteners = await shortener_store.list_shorteners()
         await query.edit_message_text(
             text=build_shortener_menu_text(shorteners),
             parse_mode=ParseMode.HTML,
@@ -948,9 +945,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        await payments.remove_shortener(data[len("short_del_"):])
+        await shortener_store.remove_shortener(data[len("short_del_"):])
         await query.answer("Removed.")
-        shorteners = await payments.list_shorteners()
+        shorteners = await shortener_store.list_shorteners()
         await query.edit_message_text(
             text=build_shortener_menu_text(shorteners),
             parse_mode=ParseMode.HTML,
@@ -962,8 +959,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Token verification panel ----------------
     if data == "settings_token_verification":
         await query.answer()
-        enabled = await payments.is_token_verification_enabled()
-        hours = await payments.get_verification_validity_hours()
+        enabled = await token_verification.is_token_verification_enabled()
+        hours = await token_verification.get_verification_validity_hours()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_verification_menu_text(enabled, hours, admin_view),
@@ -976,10 +973,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_token_verification_enabled()
-        await payments.set_token_verification_enabled(not currently_on)
+        currently_on = await token_verification.is_token_verification_enabled()
+        await token_verification.set_token_verification_enabled(not currently_on)
         await query.answer("Token verification turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        hours = await payments.get_verification_validity_hours()
+        hours = await token_verification.get_verification_validity_hours()
         await query.edit_message_text(
             text=build_verification_menu_text(not currently_on, hours, True),
             parse_mode=ParseMode.HTML,
@@ -1004,8 +1001,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Force subscribe panel ----------------
     if data == "settings_force_subscribe":
         await query.answer()
-        enabled = await payments.is_force_sub_enabled()
-        channels = await payments.list_force_sub_channels()
+        enabled = await force_subscribe.is_force_sub_enabled()
+        channels = await force_subscribe.list_force_sub_channels()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_fsub_menu_text(enabled, channels, admin_view),
@@ -1018,10 +1015,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_force_sub_enabled()
-        await payments.set_force_sub_enabled(not currently_on)
+        currently_on = await force_subscribe.is_force_sub_enabled()
+        await force_subscribe.set_force_sub_enabled(not currently_on)
         await query.answer("Force subscribe turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        channels = await payments.list_force_sub_channels()
+        channels = await force_subscribe.list_force_sub_channels()
         await query.edit_message_text(
             text=build_fsub_menu_text(not currently_on, channels, True),
             parse_mode=ParseMode.HTML,
@@ -1049,10 +1046,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        await payments.remove_force_sub_channel(data[len("fsub_del_"):])
+        await force_subscribe.remove_force_sub_channel(data[len("fsub_del_"):])
         await query.answer("Removed.")
-        enabled = await payments.is_force_sub_enabled()
-        channels = await payments.list_force_sub_channels()
+        enabled = await force_subscribe.is_force_sub_enabled()
+        channels = await force_subscribe.list_force_sub_channels()
         await query.edit_message_text(
             text=build_fsub_menu_text(enabled, channels, True),
             parse_mode=ParseMode.HTML,
@@ -1061,7 +1058,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "fsub_recheck":
-        unjoined = await payments.get_unjoined_channels(context.bot, user.id)
+        unjoined = await force_subscribe.get_unjoined_channels(context.bot, user.id)
         if unjoined:
             await query.answer("Abhi bhi kuch channels baaki hain ❌", show_alert=True)
         else:
@@ -1072,8 +1069,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Caption panel ----------------
     if data == "settings_caption":
         await query.answer()
-        enabled = await payments.is_caption_enabled()
-        template = await payments.get_caption_template()
+        enabled = await file_settings.is_caption_enabled()
+        template = await file_settings.get_caption_template()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_caption_menu_text(enabled, template, admin_view),
@@ -1086,10 +1083,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_caption_enabled()
-        await payments.set_caption_enabled(not currently_on)
+        currently_on = await file_settings.is_caption_enabled()
+        await file_settings.set_caption_enabled(not currently_on)
         await query.answer("Caption turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        template = await payments.get_caption_template()
+        template = await file_settings.get_caption_template()
         await query.edit_message_text(
             text=build_caption_menu_text(not currently_on, template, True),
             parse_mode=ParseMode.HTML,
@@ -1115,8 +1112,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Thumbnail panel ----------------
     if data == "settings_thumbnail":
         await query.answer()
-        enabled = await payments.is_thumbnail_enabled()
-        has_thumb = bool(await payments.get_thumbnail_file_id())
+        enabled = await file_settings.is_thumbnail_enabled()
+        has_thumb = bool(await file_settings.get_thumbnail_file_id())
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_thumbnail_menu_text(enabled, has_thumb, admin_view),
@@ -1129,10 +1126,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_thumbnail_enabled()
-        await payments.set_thumbnail_enabled(not currently_on)
+        currently_on = await file_settings.is_thumbnail_enabled()
+        await file_settings.set_thumbnail_enabled(not currently_on)
         await query.answer("Thumbnail turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        has_thumb = bool(await payments.get_thumbnail_file_id())
+        has_thumb = bool(await file_settings.get_thumbnail_file_id())
         await query.edit_message_text(
             text=build_thumbnail_menu_text(not currently_on, has_thumb, True),
             parse_mode=ParseMode.HTML,
@@ -1157,9 +1154,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        await payments.set_thumbnail_file_id(None)
+        await file_settings.set_thumbnail_file_id(None)
         await query.answer("Thumbnail removed.")
-        enabled = await payments.is_thumbnail_enabled()
+        enabled = await file_settings.is_thumbnail_enabled()
         await query.edit_message_text(
             text=build_thumbnail_menu_text(enabled, False, True),
             parse_mode=ParseMode.HTML,
@@ -1171,8 +1168,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Button panel ----------------
     if data == "settings_button":
         await query.answer()
-        enabled = await payments.is_custom_button_enabled()
-        btn = await payments.get_custom_button()
+        enabled = await file_settings.is_custom_button_enabled()
+        btn = await file_settings.get_custom_button()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_button_menu_text(enabled, btn, admin_view),
@@ -1185,10 +1182,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_custom_button_enabled()
-        await payments.set_custom_button_enabled(not currently_on)
+        currently_on = await file_settings.is_custom_button_enabled()
+        await file_settings.set_custom_button_enabled(not currently_on)
         await query.answer("Button turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        btn = await payments.get_custom_button()
+        btn = await file_settings.get_custom_button()
         await query.edit_message_text(
             text=build_button_menu_text(not currently_on, btn, True),
             parse_mode=ParseMode.HTML,
@@ -1213,8 +1210,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Auto delete panel ----------------
     if data == "settings_auto_delete":
         await query.answer()
-        enabled = await payments.is_auto_delete_enabled()
-        seconds = await payments.get_auto_delete_seconds()
+        enabled = await file_settings.is_auto_delete_enabled()
+        seconds = await file_settings.get_auto_delete_seconds()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_auto_delete_menu_text(enabled, seconds, admin_view),
@@ -1227,10 +1224,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_auto_delete_enabled()
-        await payments.set_auto_delete_enabled(not currently_on)
+        currently_on = await file_settings.is_auto_delete_enabled()
+        await file_settings.set_auto_delete_enabled(not currently_on)
         await query.answer("Auto delete turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        seconds = await payments.get_auto_delete_seconds()
+        seconds = await file_settings.get_auto_delete_seconds()
         await query.edit_message_text(
             text=build_auto_delete_menu_text(not currently_on, seconds, True),
             parse_mode=ParseMode.HTML,
@@ -1255,7 +1252,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Protect content panel ----------------
     if data == "settings_protect_content":
         await query.answer()
-        enabled = await payments.is_protect_content_enabled()
+        enabled = await file_settings.is_protect_content_enabled()
         admin_view = is_admin(user.id)
         await query.edit_message_text(
             text=build_protect_content_menu_text(enabled, admin_view),
@@ -1268,8 +1265,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_protect_content_enabled()
-        await payments.set_protect_content_enabled(not currently_on)
+        currently_on = await file_settings.is_protect_content_enabled()
+        await file_settings.set_protect_content_enabled(not currently_on)
         await query.answer("Protect content turned " + ("OFF ❌" if currently_on else "ON ✅"))
         await query.edit_message_text(
             text=build_protect_content_menu_text(not currently_on, True),
@@ -1282,38 +1279,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Buy / extend premium plan ----------------
     if data.startswith("buyplan_"):
         plan_id = data[len("buyplan_"):]
-        offer = await build_buy_offer(user, update.effective_chat.id, plan_id)
-        if offer is None:
-            await query.answer()
+        await query.answer("⏳ Creating your payment…")
+        result = await start_premium_checkout(context.bot, user, update.effective_chat.id, plan_id)
+        if result is None:
             await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
-            return
-        if offer == "disabled":
-            await query.answer()
+        elif result == "disabled":
             await query.edit_message_text(
                 text="🚫 Premium plan purchases are currently unavailable. "
                      "Please check back later."
             )
-            return
-        if offer == "invalid_plan":
-            await query.answer("⚠️ Invalid plan.", show_alert=True)
-            return
-        await query.answer()
-        if offer["photo_file_id"]:
-            # Editing text -> photo isn't possible, so send a fresh
-            # message when a custom picture is configured.
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=offer["photo_file_id"],
-                caption=offer["text"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=offer["keyboard"],
+        elif result == "invalid_plan":
+            await query.edit_message_text(text="⚠️ Invalid plan.")
+        elif result == "error":
+            await query.edit_message_text(
+                text="⚠️ Couldn't create the payment right now. Please try again in a minute."
             )
         else:
-            await query.edit_message_text(
-                text=offer["text"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=offer["keyboard"],
-            )
+            try:
+                await query.message.delete()  # the QR message replaces the menu
+            except Exception:
+                pass
         return
     # --------------------------------------------------------------------
 
@@ -1322,7 +1307,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        premium_map = await payments.list_premium()
+        premium_map = await premium.list_premium()
         if not premium_map:
             await query.answer("No premium users found.", show_alert=True)
             return
@@ -1345,8 +1330,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_premium_enabled()
-        await payments.set_premium_enabled(not currently_on)
+        currently_on = await premium.is_premium_enabled()
+        await premium.set_premium_enabled(not currently_on)
         await query.answer("Premium turned " + ("OFF ❌" if currently_on else "ON ✅"))
         await query.edit_message_text(
             text=build_premium_menu_text(),
@@ -1435,7 +1420,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "premium_message_back":
         await query.answer()
-        enabled = await payments.is_premium_enabled()
+        enabled = await premium.is_premium_enabled()
         await query.edit_message_text(
             text=build_premium_menu_text(),
             parse_mode=ParseMode.HTML,
@@ -1463,10 +1448,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_free_limit_enabled()
-        await payments.set_free_limit_enabled(not currently_on)
+        currently_on = await file_settings.is_free_limit_enabled()
+        await file_settings.set_free_limit_enabled(not currently_on)
         await query.answer("Free usage limit turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        count = await payments.get_free_limit_count()
+        count = await file_settings.get_free_limit_count()
         await query.edit_message_text(
             text=build_free_limit_text(not currently_on, count),
             parse_mode=ParseMode.HTML,
@@ -1487,10 +1472,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- Credits ----------------
     if data == "credits_menu":
         await query.answer()
-        balance = await payments.get_credits(user.id)
-        cost = await payments.get_credit_cost_per_file()
-        daily_on = await payments.is_daily_credit_enabled()
-        daily_amt = await payments.get_daily_credit_amount()
+        balance = await credits.get_credits(user.id)
+        cost = await credits.get_credit_cost_per_file()
+        daily_on = await credits.is_daily_credit_enabled()
+        daily_amt = await credits.get_daily_credit_amount()
         await query.edit_message_text(
             text=build_credits_text(balance, cost, daily_on, daily_amt),
             parse_mode=ParseMode.HTML,
@@ -1499,7 +1484,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "credits_daily":
-        ok, result = await payments.claim_daily_credit(user.id)
+        ok, result = await credits.claim_daily_credit(user.id)
         if ok:
             await query.answer(f"✅ +1 credit! Naya balance: {result}", show_alert=True)
         else:
@@ -1508,10 +1493,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer(
                 f"⏳ Agla daily credit {hours}h {minutes}m baad milega.", show_alert=True
             )
-        balance = await payments.get_credits(user.id)
-        cost = await payments.get_credit_cost_per_file()
-        daily_on = await payments.is_daily_credit_enabled()
-        daily_amt = await payments.get_daily_credit_amount()
+        balance = await credits.get_credits(user.id)
+        cost = await credits.get_credit_cost_per_file()
+        daily_on = await credits.is_daily_credit_enabled()
+        daily_amt = await credits.get_daily_credit_amount()
         await query.edit_message_text(
             text=build_credits_text(balance, cost, daily_on, daily_amt),
             parse_mode=ParseMode.HTML,
@@ -1521,7 +1506,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "credits_earn":
         await query.answer()
-        shorteners = await payments.list_shorteners()
+        shorteners = await shortener_store.list_shorteners()
         await query.edit_message_text(
             text=build_credits_earn_text(shorteners),
             parse_mode=ParseMode.HTML,
@@ -1531,7 +1516,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data.startswith("credits_earn_"):
         shortener_id = data[len("credits_earn_"):]
-        shorteners = {s["id"]: s for s in await payments.list_shorteners()}
+        shorteners = {s["id"]: s for s in await shortener_store.list_shorteners()}
         shortener = shorteners.get(shortener_id)
         if not shortener or not shortener.get("enabled"):
             await query.answer("⚠️ Yeh shortener ab available nahi hai.", show_alert=True)
@@ -1539,11 +1524,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer()
         me = await context.bot.get_me()
         reward = shortener.get("reward_credits", 5)
-        token = await payments.create_verify_token(
+        token = await token_verification.create_verify_token(
             user.id, purpose="credit", shortener_id=shortener_id, reward_credits=reward
         )
         long_link = build_verification_deep_link(me.username, token)
-        short_link = await payments.shorten_url(long_link, shortener_id=shortener_id)
+        short_link = await shortener_store.shorten_url(long_link, shortener_id=shortener_id)
         await query.edit_message_text(
             text="🔗 " + to_bold_unicode(f"Complete this to earn +{reward} credits:")
             + f"\n{short_link}\n\n"
@@ -1567,17 +1552,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data.startswith("creditpack_"):
         pack_id = data[len("creditpack_"):]
-        offer = await build_credit_buy_offer(user, update.effective_chat.id, pack_id)
-        if offer is None:
-            await query.answer()
+        await query.answer("⏳ Creating your payment…")
+        result = await start_credit_checkout(context.bot, user, update.effective_chat.id, pack_id)
+        if result is None:
             await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
-            return
-        if offer == "invalid_pack":
-            await query.answer("⚠️ Invalid pack.", show_alert=True)
-            return
-        await query.answer()
-        text, keyboard = offer
-        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        elif result == "invalid_pack":
+            await query.edit_message_text(text="⚠️ Invalid pack.")
+        elif result == "error":
+            await query.edit_message_text(
+                text="⚠️ Couldn't create the payment right now. Please try again in a minute."
+            )
+        else:
+            try:
+                await query.message.delete()  # the QR message replaces the menu
+            except Exception:
+                pass
         return
 
     if data == "credits_admin":
@@ -1585,10 +1574,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("🚫 Admins only.", show_alert=True)
             return
         await query.answer()
-        cost = await payments.get_credit_cost_per_file()
-        daily_on = await payments.is_daily_credit_enabled()
-        daily_amt = await payments.get_daily_credit_amount()
-        referral_reward = await payments.get_referral_reward_credits()
+        cost = await credits.get_credit_cost_per_file()
+        daily_on = await credits.is_daily_credit_enabled()
+        daily_amt = await credits.get_daily_credit_amount()
+        referral_reward = await referral.get_referral_reward_credits()
         await query.edit_message_text(
             text=build_credits_admin_text(cost, daily_on, daily_amt, referral_reward),
             parse_mode=ParseMode.HTML,
@@ -1613,12 +1602,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not is_admin(user.id):
             await query.answer("🚫 Admins only.", show_alert=True)
             return
-        currently_on = await payments.is_daily_credit_enabled()
-        await payments.set_daily_credit_enabled(not currently_on)
+        currently_on = await credits.is_daily_credit_enabled()
+        await credits.set_daily_credit_enabled(not currently_on)
         await query.answer("Daily credit turned " + ("OFF ❌" if currently_on else "ON ✅"))
-        cost = await payments.get_credit_cost_per_file()
-        daily_amt = await payments.get_daily_credit_amount()
-        referral_reward = await payments.get_referral_reward_credits()
+        cost = await credits.get_credit_cost_per_file()
+        daily_amt = await credits.get_daily_credit_amount()
+        referral_reward = await referral.get_referral_reward_credits()
         await query.edit_message_text(
             text=build_credits_admin_text(cost, not currently_on, daily_amt, referral_reward),
             parse_mode=ParseMode.HTML,
@@ -1687,24 +1676,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     elif data == "settings_premium":
         if is_admin(user.id):
-            enabled = await payments.is_premium_enabled()
+            enabled = await premium.is_premium_enabled()
             await query.edit_message_text(
                 text=build_premium_menu_text(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_premium_menu_keyboard(enabled),
             )
             return
-        if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+        if not famgateway.is_configured():
             await query.edit_message_text(text="⚠️ Payment gateway isn't configured yet.")
             return
-        if not await payments.is_premium_enabled():
+        if not await premium.is_premium_enabled():
             await query.edit_message_text(
                 text="🚫 Premium plan purchases are currently unavailable. "
                      "Please check back later."
             )
             return
-        already_premium = await payments.is_premium(user.id)
-        expiry_iso = await payments.get_premium_expiry(user.id) if already_premium else None
+        already_premium = await premium.is_premium(user.id)
+        expiry_iso = await premium.get_premium_expiry(user.id) if already_premium else None
         await query.edit_message_text(
             text=build_plan_choice_text(already_premium, expiry_iso),
             parse_mode=ParseMode.HTML,
@@ -1717,8 +1706,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=build_settings_keyboard(is_admin(user.id)),
         )
     elif data == "settings_free_limit":
-        enabled = await payments.is_free_limit_enabled()
-        count = await payments.get_free_limit_count()
+        enabled = await file_settings.is_free_limit_enabled()
+        count = await file_settings.get_free_limit_count()
         if is_admin(user.id):
             await query.edit_message_text(
                 text=build_free_limit_text(enabled, count),
@@ -1736,7 +1725,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
     elif data == "settings_refer":
         me = await context.bot.get_me()
-        stats = await payments.get_referral_stats(user.id)
+        stats = await referral.get_referral_stats(user.id)
         await query.edit_message_text(
             text=build_refer_text(me.username, user.id, stats),
             parse_mode=ParseMode.HTML,
@@ -1784,94 +1773,85 @@ def build_plan_choice_text(already_premium: bool, expiry_iso: str | None) -> str
 def build_plan_choice_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton(f"💳 {p['label']} - ₹{p['amount']}", callback_data=f"buyplan_{p['id']}")]
-        for p in payments.PLANS
+        for p in premium.PLANS
     ]
     keyboard.append([InlineKeyboardButton("◀ Back", callback_data="settings")])
     return InlineKeyboardMarkup(keyboard)
 
 
-async def build_buy_offer(user, chat_id, plan_id: str):
-    """Creates a pending PayU transaction for the chosen plan and returns
-    a dict describing the buy offer message: {"text", "keyboard",
-    "photo_file_id"}. Returns None if PayU isn't configured, "disabled"
-    if an admin has turned premium purchases off, or "invalid_plan" if
-    plan_id doesn't match any configured plan."""
-    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+async def start_premium_checkout(bot, user, chat_id, plan_id: str):
+    """Creates a FamGateway order for the chosen premium plan and sends the
+    QR message. Returns the order dict, None if the gateway isn't
+    configured, "disabled" if an admin turned premium purchases off,
+    "invalid_plan" for an unknown plan id, or "error" if the gateway
+    couldn't create the order."""
+    if not famgateway.is_configured():
         return None
-
-    if not await payments.is_premium_enabled():
+    if not await premium.is_premium_enabled():
         return "disabled"
-
-    plan = payments.get_plan(plan_id)
+    plan = premium.get_plan(plan_id)
     if plan is None:
         return "invalid_plan"
 
-    txnid = uuid.uuid4().hex[:20]
-    txn = {
-        "user_id": user.id,
-        "chat_id": chat_id,
-        "amount": plan["amount"],
-        "plan_days": plan["days"],
-        "plan_label": f"{payments.PLAN_LABEL} - {plan['label']}",
-        "firstname": user.first_name or "User",
-        "email": f"user{user.id}@telegram.local",
-        "phone": "9999999999",
-        "status": "pending",
-    }
-    await payments.save_transaction(txnid, txn)
-
-    pay_url = f"{payments.BASE_URL}/payu/pay/{txnid}"
-    buttons = [[InlineKeyboardButton(f"💳 Pay ₹{plan['amount']} now", url=pay_url)]]
-
-    custom = await payments.get_premium_message()
+    custom = await premium.get_premium_message()
+    extra = []
     if custom.get("button_text") and custom.get("button_url"):
-        buttons.append(
-            [InlineKeyboardButton(custom["button_text"], url=custom["button_url"])]
-        )
-    buttons.append([InlineKeyboardButton("◀ Back", callback_data="settings_premium")])
-    keyboard = InlineKeyboardMarkup(buttons)
+        extra.append([InlineKeyboardButton(custom["button_text"], url=custom["button_url"])])
+    extra.append([InlineKeyboardButton("◀ Back", callback_data="settings_premium")])
 
-    if custom.get("text"):
-        text = custom["text"]
-    else:
-        text = (
-            "💎 " + to_bold_unicode(f"{plan['label']} - ₹{plan['amount']}")
-            + "\n\n"
-            + "<blockquote>"
+    def caption(order):
+        price = order.get("payable_amount") or plan["amount"]
+        order_line = "\n\n🧾 " + to_bold_unicode("Order:") + f" <code>{order['order_id']}</code>"
+        if custom.get("text"):
+            # Admin's custom message replaces the default text (captions are
+            # limited to 1024 chars, so fall back if it wouldn't fit).
+            combined = custom["text"] + order_line
+            if len(combined) <= 1024:
+                return combined
+        return (
+            "💎 " + to_bold_unicode(f"{plan['label']} - ₹{price}")
+            + "\n\n<blockquote>"
             + "⏳ " + to_bold_unicode(f"Valid for {plan['days']} day(s).") + "\n"
-            + "💳 " + to_bold_unicode(
-                "Pay via UPI, UPI QR, cards, netbanking or wallet — all shown "
-                "on the payment page."
-            )
-            + "</blockquote>\n\n"
-            + to_bold_unicode("Tap the button below to pay.")
+            + "📲 " + to_bold_unicode("Scan this QR with any UPI app, or tap the button below.") + "\n"
+            + "⚡ " + to_bold_unicode("Premium activates automatically after payment.") + "\n"
+            + "⏳ " + to_bold_unicode("This QR is valid for 5 minutes.")
+            + "</blockquote>"
+            + order_line
         )
 
-    return {
-        "text": text,
-        "keyboard": keyboard,
-        "photo_file_id": custom.get("photo_file_id"),
-    }
+    try:
+        return await famgateway.start_checkout(
+            bot, user=user, chat_id=chat_id, kind="premium", amount=plan["amount"],
+            txn_fields={
+                "plan_days": plan["days"],
+                "plan_label": f"{premium.PLAN_LABEL} - {plan['label']}",
+            },
+            caption_fn=caption,
+            extra_buttons=extra,
+        )
+    except famgateway.FamGatewayError:
+        logger.exception("FamGateway order creation failed (plan %s)", plan_id)
+        return "error"
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
-    if not (payments.PAYU_KEY and payments.PAYU_SALT and payments.BASE_URL):
+    if not famgateway.is_configured():
         await update.message.reply_text(
-            "⚠️ Payment gateway isn't configured yet. Set PAYU_KEY, "
-            "PAYU_SALT and BASE_URL environment variables first."
+            "⚠️ Payment gateway isn't configured yet. Set the "
+            "FAMGATEWAY_API_KEY environment variable first."
         )
         return
-    if not await payments.is_premium_enabled():
+    if not await premium.is_premium_enabled():
         await update.message.reply_text(
             "🚫 Premium plan purchases are currently unavailable. Please "
             "check back later."
         )
         return
 
-    already_premium = await payments.is_premium(user.id)
-    expiry_iso = await payments.get_premium_expiry(user.id) if already_premium else None
+    already_premium = await premium.is_premium(user.id)
+    expiry_iso = await premium.get_premium_expiry(user.id) if already_premium else None
     await update.message.reply_text(
         text=build_plan_choice_text(already_premium, expiry_iso),
         parse_mode=ParseMode.HTML,
@@ -1891,8 +1871,8 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    expiry_iso = await payments.get_premium_expiry(user.id)
-    if expiry_iso and await payments.is_premium(user.id):
+    expiry_iso = await premium.get_premium_expiry(user.id)
+    if expiry_iso and await premium.is_premium(user.id):
         expiry = datetime.fromisoformat(expiry_iso)
         text = (
             "💎 " + to_bold_unicode("You have an active premium plan.") + "\n"
@@ -1909,10 +1889,10 @@ async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    balance = await payments.get_credits(user.id)
-    cost = await payments.get_credit_cost_per_file()
-    daily_on = await payments.is_daily_credit_enabled()
-    daily_amt = await payments.get_daily_credit_amount()
+    balance = await credits.get_credits(user.id)
+    cost = await credits.get_credit_cost_per_file()
+    daily_on = await credits.is_daily_credit_enabled()
+    daily_amt = await credits.get_daily_credit_amount()
     await update.message.reply_text(
         text=build_credits_text(balance, cost, daily_on, daily_amt),
         parse_mode=ParseMode.HTML,
@@ -1946,7 +1926,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             return
         target_id, days = int(parts[0]), int(parts[1])
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
-        await payments.set_premium(target_id, expiry.isoformat())
+        await premium.set_premium(target_id, expiry.isoformat())
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(
@@ -1963,7 +1943,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         target_id = int(raw)
-        removed = await payments.remove_premium(target_id)
+        removed = await premium.remove_premium(target_id)
         context.user_data.pop("awaiting", None)
         if removed:
             await update.message.reply_text(
@@ -1983,7 +1963,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         count = int(raw)
-        await payments.set_free_limit_count(count)
+        await file_settings.set_free_limit_count(count)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Free usage limit set to {count} per day.")
@@ -1991,7 +1971,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     if awaiting == "premium_message_text":
-        await payments.set_premium_message(text=update.message.text)
+        await premium.set_premium_message(text=update.message.text)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Premium plan message text updated.")
         return
@@ -2010,7 +1990,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
                 "⚠️ The URL must start with http:// or https:// (or /cancel)."
             )
             return
-        await payments.set_premium_message(button_text=label, button_url=url)
+        await premium.set_premium_message(button_text=label, button_url=url)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Premium plan button updated.")
         return
@@ -2032,7 +2012,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
                 )
                 return
             reward = int(parts[3])
-        await payments.add_shortener(name, domain, api_key, reward_credits=reward)
+        await shortener_store.add_shortener(name, domain, api_key, reward_credits=reward)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Shortener '{name}' added ({reward} credits reward).")
@@ -2047,7 +2027,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         hours = int(raw)
-        await payments.set_verification_validity_hours(hours)
+        await token_verification.set_verification_validity_hours(hours)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Verification validity set to {hours} hour(s).")
@@ -2064,7 +2044,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
                     "⚠️ Channel nahi mila. Check username ya bot ko admin banao (or /cancel)."
                 )
                 return
-            await payments.add_force_sub_channel(
+            await force_subscribe.add_force_sub_channel(
                 chat_id=chat.id,
                 title=chat.title or raw,
                 invite_link=f"https://t.me/{raw.lstrip('@')}",
@@ -2083,7 +2063,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
                     "⚠️ Invite link http:// ya https:// se start honi chahiye (or /cancel)."
                 )
                 return
-            await payments.add_force_sub_channel(
+            await force_subscribe.add_force_sub_channel(
                 chat_id=int(chat_id_raw), title=title, invite_link=invite_link,
             )
         context.user_data.pop("awaiting", None)
@@ -2091,7 +2071,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     if awaiting == "caption_template":
-        await payments.set_caption_template(update.message.text or "")
+        await file_settings.set_caption_template(update.message.text or "")
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Caption updated.")
         return
@@ -2110,7 +2090,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
                 "⚠️ The URL must start with http:// or https:// (or /cancel)."
             )
             return
-        await payments.set_custom_button(label, url)
+        await file_settings.set_custom_button(label, url)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Custom button updated.")
         return
@@ -2123,7 +2103,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         seconds = int(raw)
-        await payments.set_auto_delete_seconds(seconds)
+        await file_settings.set_auto_delete_seconds(seconds)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Auto delete delay set to {seconds} second(s).")
@@ -2138,7 +2118,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         cost = int(raw)
-        await payments.set_credit_cost_per_file(cost)
+        await credits.set_credit_cost_per_file(cost)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Credit cost per file set to {cost}.")
@@ -2153,7 +2133,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         amount = int(raw)
-        await payments.set_daily_credit_amount(amount)
+        await credits.set_daily_credit_amount(amount)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Daily credit amount set to {amount}.")
@@ -2168,7 +2148,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         amount = int(raw)
-        await payments.set_referral_reward_credits(amount)
+        await referral.set_referral_reward_credits(amount)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
             "✅ " + to_bold_unicode(f"Referral reward set to {amount} credits.")
@@ -2184,7 +2164,7 @@ async def admin_text_reply_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         reward = int(raw)
-        ok = await payments.set_shortener_reward(shortener_id, reward)
+        ok = await shortener_store.set_shortener_reward(shortener_id, reward)
         context.user_data.pop("awaiting", None)
         if ok:
             await update.message.reply_text(
@@ -2206,13 +2186,13 @@ async def admin_photo_reply_handler(update: Update, context: ContextTypes.DEFAUL
     file_id = update.message.photo[-1].file_id
 
     if awaiting == "premium_message_picture":
-        await payments.set_premium_message(photo_file_id=file_id)
+        await premium.set_premium_message(photo_file_id=file_id)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Premium plan picture updated.")
         return
 
     if awaiting == "thumbnail_photo":
-        await payments.set_thumbnail_file_id(file_id)
+        await file_settings.set_thumbnail_file_id(file_id)
         context.user_data.pop("awaiting", None)
         await update.message.reply_text("✅ Thumbnail updated.")
         return
@@ -2225,7 +2205,7 @@ async def main() -> None:
         )
 
     # MongoDB must be reachable before anything else starts.
-    await payments.init_db()
+    await db.init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -2248,15 +2228,18 @@ async def main() -> None:
     me = await application.bot.get_me()
     logger.info("Bot @%s started (polling)", me.username)
 
-    # --- PayU webhook / checkout HTTP server ---
-    web_app = payments.build_web_app(application.bot)
+    # --- FamGateway webhook HTTP server ---
+    web_app = famgateway.build_web_app(application.bot)
     web_app["bot_username"] = me.username
     runner = web.AppRunner(web_app)
     await runner.setup()
     port = int(os.environ.get("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info("PayU webhook server listening on port %s", port)
+    logger.info("FamGateway webhook server listening on port %s", port)
+
+    # Re-attach pollers to payments that were mid-flight during the last restart.
+    await famgateway.resume_pending(application.bot)
 
     try:
         await asyncio.Event().wait()  # run forever
@@ -2265,7 +2248,8 @@ async def main() -> None:
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
-        await payments.close_db()
+        await famgateway.shutdown()
+        await db.close_db()
 
 
 if __name__ == "__main__":
